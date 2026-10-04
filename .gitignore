@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 注意：uv.lock 故意不忽略。camel-ai 的依赖里埋着 mcp 版本坑（见 README 第六节），
+# 提交锁文件能保证换台机器装出来的还是同一套可用的依赖。
+
+# 运行产物：每次跑都会重新生成
+outputs/*.md
+outputs/*.json
+!outputs/.gitkeep

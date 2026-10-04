@@ -1,0 +1,115 @@
+"""CAMEL 双智能体角色扮演编排。
+
+这是项目的 CAMEL 核心。用的就是 CAMEL 论文里的 RolePlaying 结构：
+一个 assistant agent（负责产出内容）配一个 user agent（负责提出要求、挑刺），
+两边各自带着自己的 system message 互相对话。
+
+两个容易踩的坑，这里都绕开了：
+1. camel-ai 0.2.90 的 ChatAgent 已经没有 role_name 参数了（老教程里还有）。
+2. RolePlaying 默认会在内部另建 agent 并覆盖 system message。
+   只有把 assistant_agent / user_agent 显式传进去，人格设定才会被保留。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+from camel.agents import ChatAgent
+from camel.societies import RolePlaying
+
+from .personas import CHEN_SHI, LIN_SHU, build_system_message
+from .topics import Topic
+
+
+@dataclass
+class Turn:
+    speaker: str
+    content: str
+
+
+@dataclass
+class TopicTranscript:
+    topic: Topic
+    turns: list[Turn] = field(default_factory=list)
+
+    def to_markdown(self) -> str:
+        lines = [f"## 议题：{self.topic.section_title}", ""]
+        for turn in self.turns:
+            lines.append(f"**{turn.speaker}**：{turn.content}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def as_dialogue(self) -> str:
+        """给整理阶段用的纯对话文本。"""
+        return "\n\n".join(f"{t.speaker}：{t.content}" for t in self.turns)
+
+
+def _first_text(response) -> str:
+    """从 ChatAgentResponse 里安全取文本。"""
+    msgs = getattr(response, "msgs", None) or []
+    if not msgs:
+        return ""
+    return str(msgs[0].content).strip()
+
+
+def debate_topic(
+    topic: Topic,
+    *,
+    backend,
+    rounds: int = 3,
+    on_turn: Optional[Callable[[Turn], None]] = None,
+) -> TopicTranscript:
+    """让两位教练围绕一个议题对谈若干轮，返回完整记录。
+
+    RolePlaying.step() 的语义是：把消息交给 user agent，再把它的回复交给
+    assistant agent。所以一轮里时间顺序是「陈实先说，林数后答」。
+    """
+    assistant_agent = ChatAgent(
+        system_message=build_system_message(LIN_SHU, topic.brief, topic.goal),
+        model=backend,
+    )
+    user_agent = ChatAgent(
+        system_message=build_system_message(CHEN_SHI, topic.brief, topic.goal),
+        model=backend,
+    )
+
+    society = RolePlaying(
+        assistant_role_name=LIN_SHU.name,
+        user_role_name=CHEN_SHI.name,
+        task_prompt=topic.brief,
+        # 关掉这两个：它们会在内部再建 agent，超出「只有两位智能体」的设定
+        with_task_specify=False,
+        with_task_planner=False,
+        with_critic_in_the_loop=False,
+        model=backend,
+        assistant_agent=assistant_agent,
+        user_agent=user_agent,
+    )
+
+    transcript = TopicTranscript(topic=topic)
+
+    def record(speaker: str, content: str) -> None:
+        if not content:
+            return
+        turn = Turn(speaker=speaker, content=content)
+        transcript.turns.append(turn)
+        if on_turn:
+            on_turn(turn)
+
+    # init_chat 返回的是 assistant（林数）的开场白
+    opening = society.init_chat(init_msg_content=topic.opening)
+    record(LIN_SHU.name, _first_text(opening) or topic.opening)
+
+    message = opening
+    for _ in range(rounds):
+        assistant_response, user_response = society.step(message)
+
+        # 先记陈实（user agent），再记林数（assistant agent），保持时间顺序
+        record(CHEN_SHI.name, _first_text(user_response))
+        record(LIN_SHU.name, _first_text(assistant_response))
+
+        if assistant_response.terminated or user_response.terminated:
+            break
+
+    return transcript
