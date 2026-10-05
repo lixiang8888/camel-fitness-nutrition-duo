@@ -1,15 +1,19 @@
-"""命令行入口。"""
+"""命令行入口。
+
+这里只负责「把 pipeline 的回调接到 print 上」和解析参数；编排本身在 pipeline.py。
+同样的编排，launcher.py 把它接到网页的 SSE 广播上——两个前端共用一套流程。
+"""
 
 from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
 from pathlib import Path
 
-from .config import OUTPUT_DIR, MissingApiKey, build_backend
-from .personas import CHEN_SHI, LIN_SHU
-from .topics import CLOSING_TOPIC, TOPICS, Topic, get_topic
+from . import pipeline
+from .config import MissingApiKey, build_backend
+from .personas import COACH, NUTRITIONIST
+from .topics import CLOSING_TOPIC, TOPICS
 
 
 def _cmd_topics(_args: argparse.Namespace) -> int:
@@ -21,8 +25,6 @@ def _cmd_topics(_args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    from . import digest, society
-
     try:
         backend = build_backend(mock=args.mock)
     except MissingApiKey as exc:
@@ -32,63 +34,38 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.mock:
         print("!! 模拟模式：不会调用真实模型，产出的是占位内容，没有参考价值。\n")
 
-    topics: list[Topic] = [get_topic(k) for k in args.only.split(",")] if args.only else list(TOPICS)
-    topics.append(CLOSING_TOPIC)
+    # 每个 hook 对应原来 _cmd_run 里的每一句 print，顺序与内容逐字不变。
+    def run_start(total: int, rounds: int) -> None:
+        print(f"人格：{NUTRITIONIST.name}（{NUTRITIONIST.title}） × {COACH.name}（{COACH.title}）")
+        print(f"议题数：{total}，每个议题 {rounds} 轮\n")
 
-    print(f"人格：{LIN_SHU.name}（{LIN_SHU.title}） × {CHEN_SHI.name}（{CHEN_SHI.title}）")
-    print(f"议题数：{len(topics)}，每个议题 {args.rounds} 轮\n")
+    def run_done(result: pipeline.RunResult) -> None:
+        print(f"\n对话实录：{result.transcript_path}")
+        print(f"成果手册：{result.handbook_path}")
 
-    transcripts = []
-    sections: list[str] = []
-
-    for index, topic in enumerate(topics, 1):
-        is_closing = topic.key == CLOSING_TOPIC.key
-        print(f"[{index}/{len(topics)}] {topic.section_title}")
-
-        transcript = society.debate_topic(
-            topic,
-            backend=backend,
-            rounds=args.rounds,
-            on_turn=lambda t: print(f"    · {t.speaker} 发言 {len(t.content)} 字"),
-        )
-        transcripts.append(transcript)
-        print(f"    对话完成，共 {len(transcript.turns)} 条发言")
-
-        if is_closing:
-            # 收尾议题要把前面所有议题的结论一起喂进去，否则写不出「分歧备忘」
-            context = "\n\n".join(t.as_dialogue() for t in transcripts)
-            closing = digest.digest_closing(context, backend=backend)
-            print("    已整理出附录")
-        else:
-            sections.append(digest.digest_section(topic, transcript.as_dialogue(), backend=backend))
-            print("    已整理成手册章节")
-
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir: Path = args.out or OUTPUT_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    suffix = ".mock" if args.mock else ""
-    transcript_path = out_dir / f"transcript-{stamp}{suffix}.md"
-    handbook_path = out_dir / f"handbook-{stamp}{suffix}.md"
-
-    header = digest.HEADER.format(
-        a=LIN_SHU.name,
-        a_title=LIN_SHU.title,
-        b=CHEN_SHI.name,
-        b_title=CHEN_SHI.title,
+    hooks = pipeline.PipelineHooks(
+        on_run_start=run_start,
+        on_topic_start=lambda index, total, topic: print(
+            f"[{index}/{total}] {topic.section_title}"
+        ),
+        on_turn=lambda topic, turn: print(f"    · {turn.speaker} 发言 {len(turn.content)} 字"),
+        on_topic_done=lambda topic, transcript: print(
+            f"    对话完成，共 {len(transcript.turns)} 条发言"
+        ),
+        on_section_done=lambda topic, is_closing, markdown: print(
+            "    已整理出附录" if is_closing else "    已整理成手册章节"
+        ),
+        on_run_done=run_done,
     )
-    if args.mock:
-        header = "> ⚠️ **这是模拟模式生成的占位手册，不含任何真实营养学内容。**\n\n" + header
 
-    handbook = digest.assemble(sections, closing, header=header)
-
-    transcript_path.write_text(
-        "\n\n".join(t.to_markdown() for t in transcripts), encoding="utf-8"
+    pipeline.run_pipeline(
+        backend=backend,
+        rounds=args.rounds,
+        topics=pipeline.select_topics(args.only),
+        out_dir=args.out,
+        mock=args.mock,
+        hooks=hooks,
     )
-    handbook_path.write_text(handbook, encoding="utf-8")
-
-    print(f"\n对话实录：{transcript_path}")
-    print(f"成果手册：{handbook_path}")
     return 0
 
 

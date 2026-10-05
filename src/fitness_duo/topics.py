@@ -3,8 +3,8 @@
 每个议题 = 一节手册。议题不是「话题」，是两个人格会被迫表态的具体分歧点。
 判断标准：如果两人对这个议题天然意见一致，就不该收进来。
 
-`opening` 是林数的开场发言（在 CAMEL 里 assistant 先开口），
-陈实会针对它挑刺，对话由此展开。
+`opening` 是营养师的开场发言（在 CAMEL 里 assistant 先开口），
+教练会针对它挑刺，对话由此展开。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ class Topic:
     section_title: str
     brief: str  # 写进 system message 的议题描述
     goal: str  # 本轮要收敛出什么
-    opening: str  # 林数的开场方案
+    opening: str  # 营养师的开场方案
 
 
 TOPICS: tuple[Topic, ...] = (

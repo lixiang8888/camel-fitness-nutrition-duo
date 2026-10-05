@@ -18,7 +18,7 @@ from typing import Callable, Optional
 from camel.agents import ChatAgent
 from camel.societies import RolePlaying
 
-from .personas import CHEN_SHI, LIN_SHU, build_system_message
+from .personas import COACH, NUTRITIONIST, build_system_message
 from .topics import Topic
 
 
@@ -59,24 +59,28 @@ def debate_topic(
     backend,
     rounds: int = 3,
     on_turn: Optional[Callable[[Turn], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> TopicTranscript:
     """让两位教练围绕一个议题对谈若干轮，返回完整记录。
 
     RolePlaying.step() 的语义是：把消息交给 user agent，再把它的回复交给
-    assistant agent。所以一轮里时间顺序是「陈实先说，林数后答」。
+    assistant agent。所以一轮里时间顺序是「教练先说，营养师后答」。
+
+    `should_stop` 只在**轮次边界**被问到：一次 step() 内部是两次模型调用，
+    没法从中间掐断，所以点了停止最坏要等当前这轮 step 返回才收手。
     """
     assistant_agent = ChatAgent(
-        system_message=build_system_message(LIN_SHU, topic.brief, topic.goal),
+        system_message=build_system_message(NUTRITIONIST, topic.brief, topic.goal),
         model=backend,
     )
     user_agent = ChatAgent(
-        system_message=build_system_message(CHEN_SHI, topic.brief, topic.goal),
+        system_message=build_system_message(COACH, topic.brief, topic.goal),
         model=backend,
     )
 
     society = RolePlaying(
-        assistant_role_name=LIN_SHU.name,
-        user_role_name=CHEN_SHI.name,
+        assistant_role_name=NUTRITIONIST.name,
+        user_role_name=COACH.name,
         task_prompt=topic.brief,
         # 关掉这两个：它们会在内部再建 agent，超出「只有两位智能体」的设定
         with_task_specify=False,
@@ -97,17 +101,20 @@ def debate_topic(
         if on_turn:
             on_turn(turn)
 
-    # init_chat 返回的是 assistant（林数）的开场白
+    # init_chat 返回的是 assistant（营养师）的开场白
     opening = society.init_chat(init_msg_content=topic.opening)
-    record(LIN_SHU.name, _first_text(opening) or topic.opening)
+    record(NUTRITIONIST.name, _first_text(opening) or topic.opening)
 
     message = opening
     for _ in range(rounds):
+        if should_stop is not None and should_stop():
+            break
+
         assistant_response, user_response = society.step(message)
 
-        # 先记陈实（user agent），再记林数（assistant agent），保持时间顺序
-        record(CHEN_SHI.name, _first_text(user_response))
-        record(LIN_SHU.name, _first_text(assistant_response))
+        # 先记教练（user agent），再记营养师（assistant agent），保持时间顺序
+        record(COACH.name, _first_text(user_response))
+        record(NUTRITIONIST.name, _first_text(assistant_response))
 
         if assistant_response.terminated or user_response.terminated:
             break

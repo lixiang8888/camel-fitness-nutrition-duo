@@ -10,7 +10,7 @@ import pytest
 from fitness_duo import digest, society
 from fitness_duo.backends import ScriptedBackend
 from fitness_duo.config import MissingApiKey, build_backend
-from fitness_duo.personas import CHEN_SHI, LIN_SHU
+from fitness_duo.personas import COACH, NUTRITIONIST
 from fitness_duo.topics import CLOSING_TOPIC, TOPICS, get_topic
 
 
@@ -21,8 +21,8 @@ def backend() -> ScriptedBackend:
 
 def test_two_personas_are_actually_different():
     """人格设定是这个项目的前提，两者必须真的不同。"""
-    assert LIN_SHU.name != CHEN_SHI.name
-    assert LIN_SHU.system_message != CHEN_SHI.system_message
+    assert NUTRITIONIST.name != COACH.name
+    assert NUTRITIONIST.system_message != COACH.system_message
 
 
 def test_topics_are_wellformed():
@@ -39,7 +39,7 @@ def test_get_topic_rejects_unknown_key():
 
 
 def test_debate_alternates_and_keeps_opening(backend):
-    """开场白必须是林数写的原文，之后严格陈实、林数交替。"""
+    """开场白必须是营养师写的原文，之后严格教练、营养师交替。"""
     topic = TOPICS[0]
     transcript = society.debate_topic(topic, backend=backend, rounds=2)
 
@@ -48,11 +48,11 @@ def test_debate_alternates_and_keeps_opening(backend):
 
     speakers = [t.speaker for t in transcript.turns]
     assert speakers == [
-        LIN_SHU.name,
-        CHEN_SHI.name,
-        LIN_SHU.name,
-        CHEN_SHI.name,
-        LIN_SHU.name,
+        NUTRITIONIST.name,
+        COACH.name,
+        NUTRITIONIST.name,
+        COACH.name,
+        NUTRITIONIST.name,
     ]
 
     # 开场白原样保留，没有被模型改写
