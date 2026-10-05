@@ -27,3 +27,6 @@ packages = ["src/fitness_duo"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# launcher.py / make_shortcut.py 在项目根，不是被安装的包（只有 src/fitness_duo 是），
+# 所以测试要 import 它们，得把根目录自己加进 sys.path。
+pythonpath = ["."]

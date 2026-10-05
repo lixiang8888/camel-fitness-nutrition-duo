@@ -1,0 +1,268 @@
+"""launcher 里**纯逻辑**部分的测试。
+
+只测确定性、不需要人眼的部分：事件总线、单实例识别、页面注入。
+「起服务 + 开浏览器 + 线程」那条整链路不做 pytest（脆且没必要），
+靠手工端到端点一遍——见 README 的「网页版」一节。
+"""
+
+from __future__ import annotations
+
+import http.server
+import json
+import socket
+import threading
+import urllib.error
+import urllib.request
+
+import pytest
+
+import launcher
+
+
+# ---------------------------------------------------------------------------
+# 事件总线
+# ---------------------------------------------------------------------------
+
+def test_bus_publish_reaches_subscriber_with_increasing_seq():
+    bus = launcher._Bus()
+    q = bus.subscribe()
+    bus.publish({"type": "a"})
+    bus.publish({"type": "b"})
+
+    first = q.get_nowait()
+    second = q.get_nowait()
+    assert (first["type"], second["type"]) == ("a", "b")
+    assert second["seq"] > first["seq"]
+
+
+def test_bus_replays_history_to_late_subscriber():
+    """刷新页面后要能补回已发生的内容，否则一按 F5 对话就空了。"""
+    bus = launcher._Bus()
+    bus.publish({"type": "a"})
+    bus.publish({"type": "b"})
+
+    q = bus.subscribe()
+    assert [q.get_nowait()["type"] for _ in range(2)] == ["a", "b"]
+
+
+def test_bus_reset_clears_history_but_keeps_seq():
+    """reset 只清新一轮的历史，**不回退 seq**。
+
+    回退了的话，前端按 seq 去重就会把新一轮的事件当成旧的丢掉——页面会一片空白。
+    """
+    bus = launcher._Bus()
+    bus.publish({"type": "old"})
+    seen = bus.subscribe().get_nowait()["seq"]
+
+    bus.reset()
+    q = bus.subscribe()
+    assert q.empty(), "reset 之后不该再回放旧事件"
+
+    bus.publish({"type": "new"})
+    assert q.get_nowait()["seq"] > seen
+
+
+def test_bus_unsubscribe_stops_delivery():
+    bus = launcher._Bus()
+    q = bus.subscribe()
+    bus.unsubscribe(q)
+    bus.publish({"type": "a"})
+    assert q.empty()
+
+
+# ---------------------------------------------------------------------------
+# 单实例识别
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def live_server():
+    """在随机端口起一个真的在 serve 的 _Server。"""
+    server = launcher._Server(("127.0.0.1", 0), launcher._Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, port
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _get(port: int, path: str):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as resp:
+        return resp.read().decode("utf-8")
+
+
+def _post(port: int, path: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def test_existing_instance_false_when_port_free():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    # socket 关掉了，端口是空的
+    assert launcher._existing_instance(port) is False
+
+
+def test_existing_instance_recognises_our_server(live_server):
+    _, port = live_server
+    assert launcher._existing_instance(port) is True
+
+
+def test_existing_instance_ignores_foreign_server():
+    """别人占了端口也不能被认成自己人——认的是 /health 里的身份，不是端口通不通。"""
+    foreign = http.server.ThreadingHTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+    port = foreign.server_address[1]
+    thread = threading.Thread(target=foreign.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert launcher._existing_instance(port) is False
+    finally:
+        foreign.shutdown()
+        foreign.server_close()
+
+
+# ---------------------------------------------------------------------------
+# 页面与路由
+# ---------------------------------------------------------------------------
+
+def test_health_reports_app_id(live_server):
+    _, port = live_server
+    assert json.loads(_get(port, "/health"))["app"] == launcher._APP_ID
+
+
+def test_page_has_boot_injected(live_server):
+    _, port = live_server
+    html = _get(port, "/")
+
+    assert "__BOOT__" not in html, "占位符没被替换掉"
+    assert "健身饮食实战手册" in html
+    boot = json.loads(html.split("const BOOT = ", 1)[1].split(";\n", 1)[0])
+    keys = [t["key"] for t in boot["topics"]]
+    assert keys[-1] == "closing"
+    assert boot["topics"][-1]["fixed"] is True, "收尾议题要固定勾选"
+    assert boot["mockDefault"] is False, "模拟模式默认关（用户指定）"
+
+
+def test_page_boot_reflects_mock_flag():
+    server = launcher._Server(("127.0.0.1", 0), launcher._Handler, mock_default=True)
+    try:
+        html = launcher._build_page(server).decode("utf-8")
+        assert '"mockDefault": true' in html
+    finally:
+        server.server_close()
+
+
+def test_handbook_empty_before_any_run(live_server):
+    _, port = live_server
+    assert json.loads(_get(port, "/handbook"))["markdown"] == ""
+
+
+def test_handbook_download_404_before_any_run(live_server):
+    _, port = live_server
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(port, "/handbook.md")
+    assert exc.value.code == 404
+
+
+def test_unknown_path_404(live_server):
+    _, port = live_server
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(port, "/nope")
+    assert exc.value.code == 404
+
+
+def test_page_has_topic_adder(live_server):
+    """网页上要能自己加议题：添加表单和它的入口都得在。"""
+    _, port = live_server
+    html = _get(port, "/")
+    for el in ('id="toggleAdd"', 'id="addform"', 'id="f-title"', 'id="f-brief"',
+               'id="f-goal"', 'id="f-opening"', 'id="f-add"', 'id="mine"'):
+        assert el in html, f"页面缺少 {el}"
+
+
+def test_page_has_run_status(live_server):
+    """跑起来要看得见「没卡死」：当前动作、逐秒计时、发言进度三个位置都得在。"""
+    _, port = live_server
+    html = _get(port, "/")
+    for el in ('id="activity"', 'id="elapsed"', 'id="counter"', 'id="runline"'):
+        assert el in html, f"页面缺少 {el}"
+    assert "@keyframes pulse" in html, "运行中的状态点要有动画"
+
+
+# ---------------------------------------------------------------------------
+# /start 与自定义议题
+# ---------------------------------------------------------------------------
+
+def test_start_accepts_custom_topic(live_server):
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": [],
+        "custom": [{"title": "六、外食党的早餐", "brief": "买着吃怎么凑蛋白质"}],
+        "rounds": 1,
+        "mock": True,
+    })
+    assert res["ok"] is True
+    assert res["topics"] == ["custom-1", "closing"]
+
+
+def test_start_puts_custom_after_builtin(live_server):
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": ["baseline"],
+        "custom": [{"title": "甲", "brief": "甲议题"}],
+        "rounds": 1,
+        "mock": True,
+    })
+    assert res["topics"] == ["baseline", "custom-1", "closing"]
+
+
+def test_start_keeps_closing_last_for_real_page_payload(live_server):
+    """回归：网页发过来的 topics 里**包含** closing（那个固定勾选、禁用的框），
+    自定义议题加进来之后收尾议题曾被挤到倒数第二。这里用页面真实的载荷形状测。
+    """
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": ["baseline", "training_day", "goal", "reality", "supplements", "closing"],
+        "custom": [{"title": "六、外食党的早餐", "brief": "买着吃怎么凑蛋白质"}],
+        "rounds": 1,
+        "mock": True,
+    })
+    assert res["ok"] is True
+    assert res["topics"][-1] == "closing"
+    assert res["topics"][-2] == "custom-1"
+    assert res["topics"].count("closing") == 1
+
+
+def test_start_rejects_custom_topic_without_brief(live_server):
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": ["baseline"],
+        "custom": [{"title": "没写内容"}],
+        "rounds": 1,
+        "mock": True,
+    })
+    assert res["ok"] is False
+    assert "要讨论什么" in res["why"]
+
+
+def test_start_rejects_empty_selection(live_server):
+    _, port = live_server
+    res = _post(port, "/start", {"topics": [], "rounds": 1, "mock": True})
+    assert res["ok"] is False
+    assert "至少" in res["why"]
+
+
+def test_start_rejects_unknown_builtin_key(live_server):
+    _, port = live_server
+    res = _post(port, "/start", {"topics": ["不存在的议题"], "rounds": 1, "mock": True})
+    assert res["ok"] is False
+    assert "未知议题" in res["why"]

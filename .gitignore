@@ -11,3 +11,7 @@ __pycache__/
 outputs/*.md
 outputs/*.json
 !outputs/.gitkeep
+
+# Windows 快捷方式 —— make_shortcut.py 本该把它建在桌面上，掉在项目根目录的是误产物。
+# 而且它内嵌本机发行版名和绝对路径，换台机器就失效，仓库又是公开的，绝不提交。
+*.lnk
