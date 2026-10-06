@@ -78,14 +78,25 @@ COACH = Persona(
 )
 
 
-def build_system_message(persona: Persona, topic_brief: str, goal: str) -> str:
+def build_system_message(
+    persona: Persona, topic_brief: str, goal: str, *, reader_note: str = ""
+) -> str:
     """把人格和「本次议题」拼成最终的 system message。
 
     每个议题都会重新构造 agent，议题直接写进 system message，
     这样两个人格从第一句话起就锁定在同一个具体问题上。
+
+    `reader_note` 是 profile.py 渲染好的读者档案（谁、想要什么、身体什么情况）。
+    它挂在**最后**，于是两位教练的每一轮发言都带着同一个具体的人——
+    数字才有对象，不然「1.6–2.2 g/kg」只是一句谁都用不上的话。
+
+    空串时返回的字符串与加这个参数之前**逐字相同**，这是黄金回归的硬要求。
     """
-    return (
+    message = (
         f"{persona.system_message}\n\n"
         f"【本次议题】\n{topic_brief}\n\n"
         f"【本轮目标】\n{goal}"
     )
+    if reader_note:
+        message = f"{message}\n\n{reader_note}"
+    return message

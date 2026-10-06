@@ -10,7 +10,7 @@ import pytest
 from fitness_duo import digest, society
 from fitness_duo.backends import ScriptedBackend
 from fitness_duo.config import MissingApiKey, build_backend
-from fitness_duo.personas import COACH, NUTRITIONIST
+from fitness_duo.personas import COACH, NUTRITIONIST, build_system_message
 from fitness_duo.topics import CLOSING_TOPIC, TOPICS, get_topic
 
 
@@ -36,6 +36,31 @@ def test_topics_are_wellformed():
 def test_get_topic_rejects_unknown_key():
     with pytest.raises(KeyError):
         get_topic("不存在的议题")
+
+
+def test_build_system_message_is_unchanged_without_a_reader_note():
+    """加了 reader_note 参数之后，不传它必须还是原来那三段。
+
+    这是黄金回归的一部分：档案功能不能改变「没填档案」那条路径上的任何一个字节。
+    """
+    expected = (
+        f"{NUTRITIONIST.system_message}\n\n"
+        "【本次议题】\n议题描述\n\n"
+        "【本轮目标】\n本轮目标"
+    )
+    assert build_system_message(NUTRITIONIST, "议题描述", "本轮目标") == expected
+    assert build_system_message(
+        NUTRITIONIST, "议题描述", "本轮目标", reader_note=""
+    ) == expected
+
+
+def test_build_system_message_appends_reader_note_last():
+    """档案挂在最后：人格 → 议题 → 目标 → 读者是谁。"""
+    message = build_system_message(
+        COACH, "议题描述", "本轮目标", reader_note="【读者档案】他 32 岁"
+    )
+    assert message.endswith("【读者档案】他 32 岁")
+    assert message.index("【本轮目标】") < message.index("【读者档案】")
 
 
 def test_debate_alternates_and_keeps_opening(backend):

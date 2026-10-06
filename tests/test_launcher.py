@@ -189,6 +189,43 @@ def test_page_has_topic_adder(live_server):
         assert el in html, f"页面缺少 {el}"
 
 
+def test_page_has_profile_form(live_server):
+    """网页上要能填目标和身体情况：卡片、表单和它的入口都得在。"""
+    _, port = live_server
+    html = _get(port, "/")
+    for el in ('id="profileCard"', 'id="toggleProfile"', 'id="pform"',
+               'id="p-goals"', 'id="p-crowds"', 'id="p-goaltext"', 'id="p-crowdtext"',
+               'id="p-sex"', 'id="p-age"', 'id="p-height"', 'id="p-weight"',
+               'id="p-training"', 'id="p-constraints"', 'id="p-medical"', 'id="p-notes"',
+               'id="p-bonus"', 'id="p-preview"', 'id="p-clear"', 'id="p-err"'):
+        assert el in html, f"页面缺少 {el}"
+
+
+def test_boot_carries_goal_and_crowd_presets(live_server):
+    """预设表的单一真相源在 profile.py，页面只是渲染它。"""
+    _, port = live_server
+    boot = json.loads(_get(port, "/").split("const BOOT = ", 1)[1].split(";\n", 1)[0])
+
+    goals = {g["key"]: g for g in boot["goals"]}
+    assert {"fat_loss", "muscle_gain", "recomp", "maintain"} <= set(goals)
+    # 用户点名要的两个方向
+    assert "减脂" in goals["fat_loss"]["label"]
+    assert "增肌" in goals["muscle_gain"]["label"]
+    # 每个现实目标都要带一条专属议题，前端才有的可点
+    for key, goal in goals.items():
+        if key == "custom":
+            assert goal["bonus"] is None
+        else:
+            assert goal["bonus"]["title"] and goal["bonus"]["brief"], f"{key} 的专属议题不完整"
+            assert goal["bonus"]["opening"], "专属议题也要有开场白，否则对话没有种子"
+
+    assert {"office", "student"} <= {c["key"] for c in boot["crowds"]}
+
+    # 原有键的形状不能被这次改动动到
+    assert [t["key"] for t in boot["topics"]][-1] == "closing"
+    assert boot["defaultRounds"] == 3
+
+
 def test_page_has_run_status(live_server):
     """跑起来要看得见「没卡死」：当前动作、逐秒计时、发言进度三个位置都得在。"""
     _, port = live_server
@@ -266,3 +303,79 @@ def test_start_rejects_unknown_builtin_key(live_server):
     res = _post(port, "/start", {"topics": ["不存在的议题"], "rounds": 1, "mock": True})
     assert res["ok"] is False
     assert "未知议题" in res["why"]
+
+
+# ---------------------------------------------------------------------------
+# /start 与读者档案
+# ---------------------------------------------------------------------------
+
+def test_start_accepts_profile_and_echoes_summary(live_server):
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": ["baseline"],
+        "rounds": 1,
+        "mock": True,
+        "profile": {
+            "goal_key": "fat_loss", "sex": "男", "age": 32,
+            "height_cm": 175, "weight_kg": 82,
+        },
+    })
+    assert res["ok"] is True
+    # 响应里原有的键一个都不能少
+    assert res["topics"] == ["baseline", "closing"]
+    assert res["rounds"] == 1
+    assert res["mock"] is True
+    assert "减脂减重" in res["profile"]
+    assert "BMI 26.8" in res["profile"]
+
+
+def test_start_without_profile_still_works(live_server):
+    """没带 profile 键的老载荷要照常跑——响应里 profile 是空串，不是 None。"""
+    _, port = live_server
+    res = _post(port, "/start", {"topics": ["baseline"], "rounds": 1, "mock": True})
+    assert res["ok"] is True
+    assert res["profile"] == ""
+
+
+def test_start_with_empty_profile_is_the_same_as_none(live_server):
+    """网页会永远带一个 profile 键（哪怕全空），不能因此走出一条不同的路径。"""
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": ["baseline"], "rounds": 1, "mock": True,
+        "profile": {"goal_key": "", "age": "", "notes": ""},
+    })
+    assert res["ok"] is True
+    assert res["profile"] == ""
+
+
+@pytest.mark.parametrize("profile, keyword", [
+    ({"age": 999}, "年龄"),
+    ({"height_cm": 10}, "身高"),
+    ({"goal_key": "减脂"}, "未知"),
+    ({"goal_key": "custom"}, "其他"),
+])
+def test_start_rejects_bad_profile(live_server, profile, keyword):
+    _, port = live_server
+    res = _post(port, "/start", {
+        "topics": ["baseline"], "rounds": 1, "mock": True, "profile": profile,
+    })
+    assert res["ok"] is False
+    assert keyword in res["why"]
+
+
+def test_bad_profile_does_not_wipe_the_previous_run(live_server):
+    """档案校验必须在 bus.reset() 之前。
+
+    否则填错一个年龄，上一轮跑出来的整场对话就从页面上消失了——
+    而这跟用户想改的那一个数字毫无关系。
+    """
+    server, port = live_server
+    server.bus.publish({"type": "turn", "text": "上一轮的内容"})
+
+    res = _post(port, "/start", {
+        "topics": ["baseline"], "rounds": 1, "mock": True, "profile": {"age": 999},
+    })
+    assert res["ok"] is False
+
+    # 历史还在：新订阅者一上来照样能补回上一轮
+    assert server.bus.subscribe().get_nowait()["text"] == "上一轮的内容"

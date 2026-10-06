@@ -13,8 +13,9 @@ import re
 
 import pytest
 
-from fitness_duo import digest, pipeline
+from fitness_duo import digest, pipeline, profile, society
 from fitness_duo.backends import ScriptedBackend
+from fitness_duo.personas import COACH, NUTRITIONIST
 from fitness_duo.topics import CLOSING_TOPIC, TOPICS
 
 
@@ -293,7 +294,7 @@ def test_run_pipeline_closing_sees_all_previous_dialogue(backend, tmp_path, monk
     """收尾议题要把前面所有议题的对话一起喂进去，否则写不出分歧备忘。"""
     captured: dict[str, str] = {}
 
-    def fake_closing(dialogue: str, *, backend):
+    def fake_closing(dialogue: str, *, backend, reader_facts: str = ""):
         captured["context"] = dialogue
         return "## 附录 A\n（假）"
 
@@ -313,6 +314,189 @@ def test_run_pipeline_closing_sees_all_previous_dialogue(backend, tmp_path, monk
     assert "我的做法是：花两周时间称重记录" in context  # baseline 的开场白
     assert "外卖优先选能看清食材构成的" in context  # reality 的开场白
     assert "哪些结论是我们都真的认同的" in context  # 收尾议题自己也参与了
+
+
+# ---------------------------------------------------------------------------
+# 读者档案（定制手册）
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def prof() -> profile.Profile:
+    return profile.parse_profile({
+        "goal_key": "fat_loss",
+        "crowd_key": "office",
+        "sex": "男",
+        "age": 32,
+        "height_cm": 175,
+        "weight_kg": 82,
+    })
+
+
+def test_no_profile_and_empty_profile_are_the_same_run(backend, tmp_path):
+    """「没填档案」和「填了一张空表」必须走出同一份手册。
+
+    网页永远会带一个 profile 键（哪怕是空对象），CLI 不带。
+    这两条路径不归一的话，同一个输入会因为入口不同而产出不同的东西。
+    """
+    # 两次跑各用一个全新的 ScriptedBackend：它是**有状态**的（回复里带调用计数），
+    # 共用一个的话第二次的文本天然不同，比出来的差异与档案无关。
+    def run(out, **kwargs):
+        return pipeline.run_pipeline(
+            backend=ScriptedBackend(), rounds=1,
+            topics=pipeline.resolve_topics(["baseline"]),
+            out_dir=out, mock=True, **kwargs,
+        )
+
+    without = run(tmp_path)
+    empty = run(tmp_path / "b", profile=profile.Profile())
+    assert without.handbook == empty.handbook
+    assert "本手册对应的档案" not in without.handbook
+    assert "本手册对应的档案" not in empty.handbook
+
+
+def test_profile_lands_in_the_handbook_header(backend, tmp_path, prof):
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+    handbook = result.handbook
+    assert "本手册对应的档案" in handbook
+    assert "- 目标：减脂减重" in handbook
+    assert "BMI 26.8，超重" in handbook
+    assert "131–180 g/天" in handbook
+    # 派生数值是代码算的、不在对话里，必须说清它只是起点
+    assert "以正文为准" in handbook
+    # 手册开头不能出现 markdown 表格——launcher 的渲染器不认识
+    assert "| 项目 |" not in handbook
+
+
+def test_profile_block_sits_after_the_standard_header(backend, tmp_path, prof):
+    """档案要挂在页眉之后、正文之前，别插到章节中间去。"""
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+    assert result.handbook.index("# 健身饮食实战手册") < result.handbook.index("本手册对应的档案")
+    # 正文第一节在档案块之后（这里拿实际整理出来的那节正文比对，
+    # 不写死章节标题——模拟模式下整理环节产出的不是真实标题）
+    assert result.handbook.index("本手册对应的档案") < result.handbook.index(
+        result.sections[0].strip()
+    )
+
+
+def test_medical_profile_adds_a_deterministic_note(backend, tmp_path):
+    prof = profile.parse_profile({"medical": "高血压，正在服药"})
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+    assert "执行前请先咨询医生" in result.handbook
+
+
+def test_no_medical_note_when_nothing_was_filled(backend, tmp_path, prof):
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+    assert "执行前请先咨询医生" not in result.handbook
+
+
+def test_goal_key_lands_in_the_filename(backend, tmp_path, prof):
+    """同一个 outputs/ 下会躺着好几个人的手册，只靠时间戳分不出哪份是给谁的。"""
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+    assert "-fat_loss" in result.handbook_path.name
+    assert "-fat_loss" in result.transcript_path.name
+    assert result.handbook_path.name.endswith(".mock.md")
+
+
+def test_filename_has_no_slug_without_a_goal(backend, tmp_path):
+    """没选目标就保持既有命名不变。"""
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=profile.parse_profile({"age": 30}),
+    )
+    stamp = result.handbook_path.name.removeprefix("handbook-").removesuffix(".mock.md")
+    assert re.fullmatch(r"\d{8}-\d{6}", stamp), f"文件名里多出了别的段：{stamp}"
+
+
+def test_reader_note_reaches_both_coaches(backend, tmp_path, monkeypatch, prof):
+    """档案要进两位教练的 system message——不然数字没有对象。"""
+    seen: list[tuple[str, str]] = []
+    real = society.build_system_message
+
+    def spy(persona, topic_brief, goal, *, reader_note=""):
+        seen.append((persona.name, reader_note))
+        return real(persona, topic_brief, goal, reader_note=reader_note)
+
+    monkeypatch.setattr(society, "build_system_message", spy)
+
+    pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+
+    # baseline + closing 两个议题，每个议题建两个 agent
+    assert len(seen) == 4
+    assert {name for name, _ in seen} == {NUTRITIONIST.name, COACH.name}
+    for _, note in seen:
+        assert "读者档案" in note
+        assert "131–180 g/天" in note
+        assert "尽量保住肌肉" in note, "目标自带的立场说明也要带上"
+
+
+def test_reader_facts_reach_the_editor(backend, tmp_path, monkeypatch, prof):
+    """整理环节也要拿到档案——它负责把不适合这位读者的建议挑出去。"""
+    seen: dict[str, str] = {}
+
+    def fake_section(topic, dialogue, *, backend, reader_facts=""):
+        seen[topic.key] = reader_facts
+        return "## 节"
+
+    def fake_closing(dialogue, *, backend, reader_facts=""):
+        seen["closing"] = reader_facts
+        return "## 附录"
+
+    monkeypatch.setattr(digest, "digest_section", fake_section)
+    monkeypatch.setattr(digest, "digest_closing", fake_closing)
+
+    pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True, profile=prof,
+    )
+
+    assert set(seen) == {"baseline", "closing"}
+    assert all("减脂减重" in facts for facts in seen.values())
+    # 给整理环节的是事实，不带目标立场说明（那份是给两位教练吵架用的）
+    assert all("尽量保住肌肉" not in facts for facts in seen.values())
+
+
+def test_editor_gets_empty_facts_without_a_profile(backend, tmp_path, monkeypatch):
+    seen: dict[str, str] = {}
+
+    def fake_section(topic, dialogue, *, backend, reader_facts=""):
+        seen["facts"] = reader_facts
+        return "## 节"
+
+    monkeypatch.setattr(digest, "digest_section", fake_section)
+    monkeypatch.setattr(digest, "digest_closing", lambda d, *, backend, reader_facts="": "## 附录")
+
+    pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True,
+    )
+    assert seen["facts"] == ""
+
+
+def test_stopping_still_writes_nothing_with_a_profile(backend, tmp_path, prof):
+    with pytest.raises(pipeline.RunStopped):
+        pipeline.run_pipeline(
+            backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+            out_dir=tmp_path, mock=True, profile=prof, should_stop=lambda: True,
+        )
+    assert list(tmp_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

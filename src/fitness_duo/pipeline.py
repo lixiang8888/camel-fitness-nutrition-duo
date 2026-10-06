@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from .config import OUTPUT_DIR
 from .personas import COACH, NUTRITIONIST
+from .profile import Profile
 from .topics import CLOSING_TOPIC, TOPICS, Topic, get_topic
 
 if TYPE_CHECKING:  # 只为类型标注，运行时不导入（避免拖进 camel）
@@ -174,12 +175,18 @@ def run_pipeline(
     mock: bool = False,
     hooks: Optional[PipelineHooks] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    profile: Optional[Profile] = None,
 ) -> RunResult:
     """跑完整流程。产物全部跑完才落盘，中途抛异常或喊停都不留半成品。
 
     `should_stop` 的检查点只有两处：议题开始前、某个议题对谈结束后。
     所以喊停最坏要等当前这一轮对谈跑完（society.step() 内部是两次模型调用，
     没法从中间掐断）。
+
+    `profile` 是读者档案。**本模块是唯一认识 Profile 的地方**：往下传的
+    是它渲染好的两段字符串（给两位教练的 / 进手册的），society 和 digest
+    都只收 str。空档案在这里被归一成 None——网页永远会带一个 profile 键，
+    不归一的话「网页发空对象」会走出一条与 CLI 不同的路径。
     """
     # 懒 import：这两个模块会拖进 camel，而 `fitness-duo topics` 这种子命令
     # 不该为一个议题表付 camel 的导入开销。原来的 cli._cmd_run 也是这么做的。
@@ -188,6 +195,10 @@ def run_pipeline(
     topics = list(topics) if topics else select_topics("")
     total = len(topics)
     h = hooks or PipelineHooks()
+
+    prof = profile if (profile is not None and not profile.is_empty()) else None
+    reader_note = prof.for_agents() if prof else ""
+    reader_facts = prof.facts_markdown() if prof else ""
 
     if h.on_run_start:
         h.on_run_start(total, rounds)
@@ -213,6 +224,7 @@ def run_pipeline(
             # 默认参数绑住当前 topic，不然闭包会捕获循环变量
             on_turn=(lambda t, _topic=topic: h.on_turn(_topic, t)) if h.on_turn else None,
             should_stop=should_stop,
+            reader_note=reader_note,
         )
         transcripts.append(transcript)
         if h.on_topic_done:
@@ -227,10 +239,12 @@ def run_pipeline(
         if is_closing:
             # 收尾议题要把前面所有议题的结论一起喂进去，否则写不出「分歧备忘」
             context = "\n\n".join(t.as_dialogue() for t in transcripts)
-            closing = digest.digest_closing(context, backend=backend)
+            closing = digest.digest_closing(context, backend=backend, reader_facts=reader_facts)
             produced = closing
         else:
-            produced = digest.digest_section(topic, transcript.as_dialogue(), backend=backend)
+            produced = digest.digest_section(
+                topic, transcript.as_dialogue(), backend=backend, reader_facts=reader_facts
+            )
             sections.append(produced)
 
         if h.on_section_done:
@@ -242,13 +256,21 @@ def run_pipeline(
     out.mkdir(parents=True, exist_ok=True)
 
     suffix = ".mock" if mock else ""
-    transcript_path = out / f"transcript-{stamp}{suffix}.md"
-    handbook_path = out / f"handbook-{stamp}{suffix}.md"
+    # 带目标时在文件名里留个 ASCII 短标记：同一个目录下会躺着好几个人的手册，
+    # 只靠时间戳分不出哪份是给谁的。没档案时不加，保持既有命名不变。
+    slug = f"-{prof.goal_key}" if prof and prof.goal_key else ""
+    transcript_path = out / f"transcript-{stamp}{slug}{suffix}.md"
+    handbook_path = out / f"handbook-{stamp}{slug}{suffix}.md"
 
     # 只用称呼，不带上 title——「营养师（循证运动营养师，负责…）」这种自我重复读着别扭
     header = digest.HEADER.format(a=NUTRITIONIST.name, b=COACH.name)
     if mock:
         header = "> ⚠️ **这是模拟模式生成的占位手册，不含任何真实营养学内容。**\n\n" + header
+    if prof:
+        # 档案块由代码生成，直接拼进 header——assemble 的签名因此不用动
+        header = f"{header}\n\n{reader_facts}"
+        if (note := prof.medical_note()):
+            header = f"{header}\n\n{note}"
 
     handbook = digest.assemble(sections, closing, header=header)
 

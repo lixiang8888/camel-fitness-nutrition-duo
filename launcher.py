@@ -59,6 +59,7 @@ from pathlib import Path
 from fitness_duo import pipeline
 from fitness_duo.config import MissingApiKey, build_backend
 from fitness_duo.personas import COACH, NUTRITIONIST
+from fitness_duo.profile import CROWDS, GOALS, InvalidProfile, Profile, parse_profile
 from fitness_duo.topics import CLOSING_TOPIC, TOPICS
 
 #: /health 里报的身份。启动时用它认「这个端口上是不是已经有一个我了」——
@@ -127,11 +128,22 @@ class _Bus:
 class _Session:
     """一次 run 的全部状态。每次点「开始」新建一个，用完即弃。"""
 
-    def __init__(self, bus: _Bus, *, topics, rounds: int, mock: bool) -> None:
+    def __init__(
+        self,
+        bus: _Bus,
+        *,
+        topics,
+        rounds: int,
+        mock: bool,
+        profile: Profile | None = None,
+    ) -> None:
         self.bus = bus
         self.topics = topics
         self.rounds = rounds
         self.mock = mock
+        #: 读者档案。进 worker 之后**只读**：不在 server 上另存一份让两边都能读，
+        #: 那正是「worker 写了 session、路由读了 server」那种对不上的老毛病。
+        self.profile = profile
         self.stopped = threading.Event()
         self.finished = threading.Event()
         self.handbook = ""
@@ -150,6 +162,9 @@ class _Session:
                 "rounds": rounds,
                 "mock": self.mock,
                 "topics": [{"key": t.key, "title": t.section_title} for t in self.topics],
+                # 档案摘要直接从这里取——它就在 session 上，
+                # 不必为此改动 PipelineHooks.on_run_start 的签名
+                "profile": self.profile.summary() if self.profile else "",
             })
 
         def topic_start(index: int, total: int, topic) -> None:
@@ -219,6 +234,7 @@ class _Session:
                 mock=self.mock,
                 hooks=self._hooks(),
                 should_stop=self.stopped.is_set,
+                profile=self.profile,
             )
             self.handbook = result.handbook
             self.handbook_path = result.handbook_path
@@ -360,6 +376,18 @@ class _Handler(BaseHTTPRequestHandler):
                 rounds = 3
             mock = bool(body.get("mock"))
 
+            # 档案的校验必须在 bus.reset() **之前**：填错一个年龄就把上一轮的
+            # 对话历史清掉，是很讨厌的一种失败方式。
+            try:
+                reader = parse_profile(body.get("profile") or {})
+            except InvalidProfile as exc:
+                self._json({"ok": False, "why": str(exc)})
+                return
+            # 网页永远会带一个 profile 键（哪怕全空），归一成 None 才能和
+            # 「命令行一个参数都没填」走同一条路
+            if reader.is_empty():
+                reader = None
+
             if not keys and not custom:
                 self._json({"ok": False, "why": "至少要选一个议题（或者自己加一个）。"})
                 return
@@ -372,11 +400,14 @@ class _Handler(BaseHTTPRequestHandler):
 
             self.server.bus.reset()
 
-            session = _Session(self.server.bus, topics=topics, rounds=rounds, mock=mock)
+            session = _Session(
+                self.server.bus, topics=topics, rounds=rounds, mock=mock, profile=reader
+            )
             self.server.session = session
             session.start()
             self._json({"ok": True, "rounds": rounds, "mock": mock,
-                        "topics": [t.key for t in topics]})
+                        "topics": [t.key for t in topics],
+                        "profile": reader.summary() if reader else ""})
         elif path == "/stop":
             session = self.server.session
             if session is None:
@@ -470,19 +501,44 @@ def _open_browser(url: str) -> None:
         pass
 
 
+def _boot_payload(server: _Server) -> dict:
+    """注入页面里的配置。目标/处境的单一真相源在 profile.py，页面只负责渲染。
+
+    每个目标还带上它的**专属议题**——前端把它当成一条预填好的自定义议题，
+    点了才进议题表。这样「不同目标讨论的东西不同」不用动后端一行代码。
+    """
+    return {
+        "topics": [
+            {"key": t.key, "title": t.section_title, "fixed": False} for t in TOPICS
+        ] + [
+            {"key": CLOSING_TOPIC.key, "title": CLOSING_TOPIC.section_title, "fixed": True}
+        ],
+        "defaultRounds": 3,
+        "mockDefault": server.mock_default,
+        "goals": [
+            {
+                "key": g.key,
+                "label": g.label,
+                "brief": g.brief,
+                "bonus": (
+                    {
+                        "title": g.bonus.title,
+                        "brief": g.bonus.brief,
+                        "goal": g.bonus.goal,
+                        "opening": g.bonus.opening,
+                    }
+                    if g.bonus
+                    else None
+                ),
+            }
+            for g in GOALS
+        ],
+        "crowds": [{"key": c.key, "label": c.label, "brief": c.brief} for c in CROWDS],
+    }
+
+
 def _build_page(server: _Server) -> bytes:
-    boot = json.dumps(
-        {
-            "topics": [
-                {"key": t.key, "title": t.section_title, "fixed": False} for t in TOPICS
-            ] + [
-                {"key": CLOSING_TOPIC.key, "title": CLOSING_TOPIC.section_title, "fixed": True}
-            ],
-            "defaultRounds": 3,
-            "mockDefault": server.mock_default,
-        },
-        ensure_ascii=False,
-    )
+    boot = json.dumps(_boot_payload(server), ensure_ascii=False)
     return _PAGE.replace("__BOOT__", boot).encode("utf-8")
 
 
@@ -603,17 +659,36 @@ _PAGE = r"""<!DOCTYPE html>
   .rm { border: 0; background: none; color: var(--muted); cursor: pointer;
         padding: 0 2px; font-size: 13px; line-height: 1; }
   .rm:hover { color: var(--bad); }
-  #addform { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
-  #addform.on { display: block; }
-  #addform label { display: block; font-size: 12.5px; color: var(--muted); margin: 9px 0 3px; }
-  #addform input, #addform textarea {
+  /* 自定义议题表单与档案表单共用一套控件样式，免得写两份、改一处漏一处 */
+  #addform, #pform { display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+  #addform.on, #pform.on { display: block; }
+  #addform label, #pform label { display: block; font-size: 12.5px; color: var(--muted); margin: 9px 0 3px; }
+  #addform input, #addform textarea,
+  #pform input, #pform textarea, #pform select {
     width: 100%; font: inherit; color: var(--fg); background: var(--panel);
     border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; outline: none;
   }
-  #addform textarea { resize: vertical; min-height: 52px; }
-  #addform input:focus, #addform textarea:focus { border-color: var(--accent); }
-  #addform .err { color: var(--bad); font-size: 12.5px; margin-top: 6px; min-height: 17px; }
-  #addform .row { margin-top: 4px; }
+  #addform textarea, #pform textarea { resize: vertical; min-height: 52px; }
+  #addform input:focus, #addform textarea:focus,
+  #pform input:focus, #pform textarea:focus, #pform select:focus { border-color: var(--accent); }
+  #addform .err, #pform .err { color: var(--bad); font-size: 12.5px; margin-top: 6px; min-height: 17px; }
+  #addform .row, #pform .row { margin-top: 4px; }
+  /* 目标与处境是单选，但再点一次要能取消——所以用按钮而不是 radio，不用加"不选"这一项 */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font: inherit; font-size: 12.5px; line-height: 1.5; padding: 4px 12px;
+    border: 1px solid var(--border); border-radius: 999px;
+    background: var(--panel); color: var(--fg); cursor: pointer;
+  }
+  .chip:hover:not(:disabled) { background: var(--bg); }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chip.bonus { border-style: dashed; border-color: var(--accent); color: var(--accent); }
+  .chip.bonus:hover:not(:disabled) { background: #eef4ff; }
+  #p-bonus { margin-top: 8px; }
+  #p-bonus:empty { display: none; }
+  #pform .grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  #pform .grid > * { flex: 1 1 110px; min-width: 0; width: auto; }
+  #psummary { margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -622,6 +697,71 @@ _PAGE = r"""<!DOCTYPE html>
     <h1>健身饮食实战手册</h1>
     <span id="status"><span class="dot" id="dot"></span><span id="statustext">就绪</span></span>
   </header>
+
+  <div class="card pad" id="profileCard">
+    <div class="row">
+      <strong style="font-size:13px">你的目标与身体情况</strong>
+      <span class="spacer"></span>
+      <button id="toggleProfile">展开填写</button>
+    </div>
+    <div class="hint" id="psummary"></div>
+
+    <div id="pform">
+      <label>你的目标 —— 决定这份手册往哪个方向写</label>
+      <div class="chips" id="p-goals"></div>
+      <div id="p-goaltext-wrap">
+        <input id="p-goaltext" maxlength="60"
+          placeholder="用一句话说明你想要什么，例如：备战半马，顺便掉点体重">
+      </div>
+      <div id="p-bonus"></div>
+
+      <label>你的处境（选填）—— 决定「理论上最优」能不能落地</label>
+      <div class="chips" id="p-crowds"></div>
+      <div id="p-crowdtext-wrap">
+        <input id="p-crowdtext" maxlength="60"
+          placeholder="例如：常年夜班，白天补觉，吃饭时间很乱">
+      </div>
+
+      <label>身体情况（选填；填了身高体重才算得出 BMI 和蛋白质克数）</label>
+      <div class="grid">
+        <select id="p-sex">
+          <option value="">性别（不填）</option>
+          <option value="男">男</option>
+          <option value="女">女</option>
+          <option value="不详">不详</option>
+        </select>
+        <input id="p-age" type="number" min="14" max="100" placeholder="年龄">
+        <input id="p-height" type="number" min="120" max="230" placeholder="身高 cm">
+        <input id="p-weight" type="number" min="30" max="250" step="0.1" placeholder="体重 kg">
+      </div>
+      <div class="hint" id="p-preview"></div>
+
+      <label>训练情况</label>
+      <textarea id="p-training" maxlength="200"
+        placeholder="例如：每周 3 次力量训练，练了半年，主要是深蹲卧推硬拉"></textarea>
+
+      <label>饮食限制与忌口</label>
+      <textarea id="p-constraints" maxlength="200"
+        placeholder="例如：乳糖不耐；不吃牛肉；素食；公司食堂只有川菜"></textarea>
+
+      <label>伤病与健康状况</label>
+      <textarea id="p-medical" maxlength="200"
+        placeholder="例如：膝盖有旧伤不能跑跳；高血压正在服药；孕期。没有就留空"></textarea>
+
+      <label>其他诉求 —— 直接说给两位教练听</label>
+      <textarea id="p-notes" maxlength="500"
+        placeholder="例如：想在三个月内看到明显变化，但周末有饭局，不想戒酒"></textarea>
+
+      <div class="err" id="p-err"></div>
+      <div class="row">
+        <button id="p-clear">清除档案</button>
+        <span class="spacer"></span>
+        <span class="hint" style="margin-top:0">
+          档案会随这次运行发给模型，并写进手册开头；草稿存在本机浏览器里
+        </span>
+      </div>
+    </div>
+  </div>
 
   <div class="card pad">
     <div class="topics" id="topics"></div>
@@ -806,6 +946,199 @@ $("f-add").onclick = () => {
 });
 renderMine();
 
+// ---- 读者档案：目标 + 处境 + 身体情况 ----
+// 单一真相源是 src/fitness_duo/profile.py：预设表、校验、写进手册的那块东西全在那边。
+// 这里只负责收集和显示，**权威校验在后端**（错误走 /start 的 ok:false 回来）。
+const PSTORE = "fitness-duo-profile";
+const P_FIELDS = {
+  "p-goaltext": "goal_text", "p-crowdtext": "crowd_text", "p-sex": "sex",
+  "p-age": "age", "p-height": "height_cm", "p-weight": "weight_kg",
+  "p-training": "training", "p-constraints": "constraints",
+  "p-medical": "medical", "p-notes": "notes"
+};
+let pdata = {
+  goal_key: "", goal_text: "", crowd_key: "", crowd_text: "",
+  sex: "", age: "", height_cm: "", weight_kg: "",
+  training: "", constraints: "", medical: "", notes: ""
+};
+try {
+  const saved = JSON.parse(localStorage.getItem(PSTORE) || "null");
+  if (saved && typeof saved === "object") { pdata = Object.assign(pdata, saved); }
+} catch (e) { /* 隐私模式等，忽略 */ }
+
+function saveProfile() {
+  try { localStorage.setItem(PSTORE, JSON.stringify(pdata)); } catch (e) { /* 忽略 */ }
+}
+
+// 公式与 profile.py 的 bmi / bmi_label / protein_range 保持一致。
+// 改了那边记得改这里——Python 侧的取值被 tests/test_profile.py 钉死了，
+// 真漂了会先在测试里响。这里只是预览，手册里的数字以 Python 算的为准。
+function bmiOf(h, w) {
+  if (!h || !w) { return null; }
+  return Math.round((w / Math.pow(h / 100, 2)) * 10) / 10;
+}
+function bmiLabelOf(b) {
+  if (b === null) { return ""; }
+  if (b < 18.5) { return "偏瘦"; }
+  if (b < 24) { return "正常"; }
+  if (b < 28) { return "超重"; }
+  return "肥胖";
+}
+
+Object.keys(P_FIELDS).forEach((id) => {
+  const el = $(id);
+  el.value = pdata[P_FIELDS[id]] || "";
+  const onEdit = () => {
+    pdata[P_FIELDS[id]] = el.value;
+    saveProfile();
+    renderDerived();
+  };
+  el.addEventListener("input", onEdit);
+  el.addEventListener("change", onEdit);   // <select> 走这条
+});
+
+function renderChips(host, presets, keyField) {
+  host.innerHTML = "";
+  for (const preset of presets) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "chip" + (pdata[keyField] === preset.key ? " on" : "");
+    btn.textContent = preset.label;
+    if (preset.brief) { btn.title = preset.brief; }
+    btn.onclick = () => {
+      // 再点一次取消。目标和处境都是选填的，点了就回不去会很别扭，
+      // 所以用按钮而不是 radio——也省掉一个「不限」选项。
+      pdata[keyField] = pdata[keyField] === preset.key ? "" : preset.key;
+      saveProfile();
+      renderProfile();
+    };
+    host.appendChild(btn);
+  }
+}
+function renderBonus() {
+  const host = $("p-bonus");
+  host.innerHTML = "";
+  const goal = BOOT.goals.find((g) => g.key === pdata.goal_key);
+  if (!goal || !goal.bonus) { return; }
+  const bonus = goal.bonus;
+  const added = customTopics.some((t) => t.title === bonus.title);
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "chip bonus";
+  btn.textContent = added ? "✓ 已加入：" + bonus.title : "＋ 加一节「" + bonus.title + "」";
+  btn.title = bonus.brief;
+  btn.disabled = added;
+  btn.onclick = () => {
+    // 专属议题就是一条**预填好的自定义议题**——复用现成的全部机制，后端零改动
+    if (customTopics.some((t) => t.title === bonus.title)) { return; }
+    customTopics.push({
+      title: bonus.title, brief: bonus.brief, goal: bonus.goal, opening: bonus.opening
+    });
+    saveCustom(); renderMine(); renderBonus();
+  };
+  host.appendChild(btn);
+}
+function psummaryParts() {
+  const parts = [];
+  const goal = BOOT.goals.find((g) => g.key === pdata.goal_key);
+  const crowd = BOOT.crowds.find((c) => c.key === pdata.crowd_key);
+  if (goal) {
+    parts.push(goal.key === "custom" ? (pdata.goal_text.trim() || "其他目标") : goal.label);
+  }
+  if (crowd) {
+    parts.push(crowd.key === "custom" ? (pdata.crowd_text.trim() || "其他处境") : crowd.label);
+  }
+  const who = [pdata.sex, pdata.age ? pdata.age + " 岁" : ""].filter(Boolean).join(" ");
+  if (who) { parts.push(who); }
+  const size = [
+    pdata.height_cm ? parseFloat(pdata.height_cm) + "cm" : "",
+    pdata.weight_kg ? parseFloat(pdata.weight_kg) + "kg" : ""
+  ].filter(Boolean).join("/");
+  if (size) { parts.push(size); }
+  const bmi = bmiOf(parseFloat(pdata.height_cm), parseFloat(pdata.weight_kg));
+  if (bmi !== null) { parts.push("BMI " + bmi + "（" + bmiLabelOf(bmi) + "）"); }
+  return parts;
+}
+function renderDerived() {
+  const parts = psummaryParts();
+  // 这行摘要折叠着也看得见，它是这个功能的入口——不填就明说不填的后果
+  $("psummary").textContent = parts.length
+    ? "本次档案：" + parts.join(" · ")
+    : "未填写 —— 会生成一份面向所有人的通用手册。";
+
+  const w = parseFloat(pdata.weight_kg);
+  const bmi = bmiOf(parseFloat(pdata.height_cm), w);
+  const bits = [];
+  if (bmi !== null) { bits.push("BMI " + bmi + "（" + bmiLabelOf(bmi) + "）"); }
+  if (w > 0) {
+    bits.push("蛋白质 " + Math.round(w * 1.6) + "–" + Math.round(w * 2.2) + " g/天");
+  }
+  $("p-preview").textContent = bits.length
+    ? "换算预览：" + bits.join(" · ") + "（精确值以手册为准）"
+    : "";
+}
+function renderProfile() {
+  renderChips($("p-goals"), BOOT.goals, "goal_key");
+  renderChips($("p-crowds"), BOOT.crowds, "crowd_key");
+  // 「其他（自己写）」才展开输入框
+  $("p-goaltext-wrap").style.display = pdata.goal_key === "custom" ? "block" : "none";
+  $("p-crowdtext-wrap").style.display = pdata.crowd_key === "custom" ? "block" : "none";
+  renderBonus();
+  renderDerived();
+}
+function showProfileForm(on) {
+  $("pform").className = on ? "on" : "";
+  $("toggleProfile").textContent = on ? "收起" : "展开填写";
+}
+$("toggleProfile").onclick = () => showProfileForm(!$("pform").className);
+
+$("p-clear").onclick = () => {
+  // 清掉就没了（尤其病历那几栏是手打的），所以问一句
+  if (!confirm("清空填写的目标与身体情况？草稿会一起从浏览器里删掉。")) { return; }
+  Object.keys(P_FIELDS).forEach((id) => { $(id).value = ""; pdata[P_FIELDS[id]] = ""; });
+  pdata.goal_key = ""; pdata.crowd_key = "";
+  $("p-err").textContent = "";
+  saveProfile();
+  renderProfile();
+  showProfileForm(true);
+};
+
+function profileClientError() {
+  // 只挡「选了其他却没写」这一种。范围校验不在这里重做一遍——
+  // 那是 profile.py 的职责，重做就是给自己留一个会漂的第二真相源。
+  if (pdata.goal_key === "custom" && !pdata.goal_text.trim()) {
+    return "目标选了「其他」，请用一句话说清你想要什么。";
+  }
+  if (pdata.crowd_key === "custom" && !pdata.crowd_text.trim()) {
+    return "处境选了「其他」，请用一句话说清你的情况。";
+  }
+  return "";
+}
+
+function collectProfile() {
+  const p = {
+    goal_key: pdata.goal_key,
+    goal_text: pdata.goal_key === "custom" ? pdata.goal_text.trim() : "",
+    crowd_key: pdata.crowd_key,
+    crowd_text: pdata.crowd_key === "custom" ? pdata.crowd_text.trim() : "",
+    sex: pdata.sex,
+    age: pdata.age,
+    height_cm: pdata.height_cm,
+    weight_kg: pdata.weight_kg,
+    training: pdata.training.trim(),
+    constraints: pdata.constraints.trim(),
+    medical: pdata.medical.trim(),
+    notes: pdata.notes.trim()
+  };
+  // 全空就不发档案。后端本来也会把空档案归一成 None，但少传一个没意义的对象，
+  // 出问题时看请求体更干净。
+  return Object.values(p).some((v) => v !== "" && v !== null && v !== undefined) ? p : null;
+}
+
+renderProfile();
+// 存过草稿就直接摊开，省得用户以为自己的档案丢了
+showProfileForm(psummaryParts().length > 0);
+
 // ---- 状态与渲染 ----
 function setStatus(text, tone) {
   $("statustext").textContent = text;
@@ -826,6 +1159,15 @@ function setRunning(on) {
   });
   // 自定义议题的勾选框和删除按钮也一起锁住
   $("mine").querySelectorAll("input, button").forEach((el) => { el.disabled = on; });
+  // 档案区的控件：跑起来之后不该还能改——那次运行用的就是提交时那份
+  ["toggleProfile", "p-clear", "p-goaltext", "p-crowdtext", "p-sex", "p-age",
+   "p-height", "p-weight", "p-training", "p-constraints", "p-medical", "p-notes"]
+    .forEach((id) => { const el = $(id); if (el) { el.disabled = on; } });
+  // chips 是动态生成的，得现查。停止时重新渲染一遍，把「已加入」这类
+  // 本来就该禁用的一起恢复正确。
+  document.querySelectorAll("#p-goals .chip, #p-crowds .chip, #p-bonus .chip")
+    .forEach((el) => { el.disabled = on; });
+  if (!on) { renderProfile(); }
 }
 function notice(text, tone) {
   $("notice").className = tone || "";
@@ -839,6 +1181,7 @@ function notice(text, tone) {
 //   2. 逐秒走的计时器
 //   3. 发言进度 N/M —— 每个议题的发言条数是固定的，总数在开跑前就能算出来
 let timerId = null, startedAt = 0, turnsDone = 0, turnsTotal = 0, nextSpeaker = "";
+let runProfile = "";        // 本次运行的档案摘要，挂在进度行上
 
 function tickElapsed() {
   if (!startedAt) { return; }
@@ -900,7 +1243,14 @@ function handle(ev) {
   lastSeq = ev.seq;
 
   if (ev.type === "run_start") {
-    $("progress").textContent = "";
+    // 清空放在这里、而不是点「开始」那一下。点「开始」是先清空再发请求的，
+    // 于是后端一旦拒绝（档案填错、议题 key 不认识），上一轮的对话就从页面上
+    // 消失了——服务端的 bus 历史其实还在，但用户得手动刷新才看得回来。
+    // run_start 是**跑起来之后**的第一个事件，清在这儿就不会误伤。
+    $("chat").innerHTML = "";
+    $("hb").innerHTML = '<div class="empty">跑完才有手册。</div>';
+    runProfile = ev.profile || "";
+    $("progress").textContent = runProfile ? "本次针对：" + runProfile : "";
     notice("");
     beginRun(ev.total, ev.rounds);
     setActivity("准备中", true);
@@ -910,7 +1260,9 @@ function handle(ev) {
     // 每个议题都是营养师先开口（init_chat 的开场白）
     nextSpeaker = SIDE_NAME.lin;
     setActivity("正在生成 " + nextSpeaker + " 的发言", true);
-    $("progress").textContent = "[" + ev.index + "/" + ev.total + "] " + ev.title;
+    // 档案摘要一直挂在进度行上：跑的时候才能一眼看出这份手册是给谁写的
+    $("progress").textContent = "[" + ev.index + "/" + ev.total + "] " + ev.title
+      + (runProfile ? "　—　本次针对：" + runProfile : "");
     setStatus("对谈中", "live");
   } else if (ev.type === "turn") {
     appendTurn(ev);
@@ -963,8 +1315,20 @@ $("start").onclick = async () => {
     return;
   }
 
-  $("chat").innerHTML = "";
-  $("hb").innerHTML = '<div class="empty">跑完才有手册。</div>';
+  // 先在本机挡一道明显的漏填。放在清空对话之前——为了一句「其他没写」
+  // 把上一轮的对话记录擦掉，代价太大。
+  const perr = profileClientError();
+  if (perr) {
+    showProfileForm(true);
+    $("p-err").textContent = perr;
+    notice("档案还没填完。", "bad");
+    return;
+  }
+  $("p-err").textContent = "";
+
+  // 新一轮的 seq 从服务端重来，去重游标要跟着归零。记下旧值是为了在请求
+  // 被拒时放回去——不然 EventSource 重连一次就会把旧事件重新渲染一遍。
+  const prevSeq = lastSeq;
   lastSeq = -1;
   notice("");
   $("progress").textContent = "";
@@ -979,9 +1343,12 @@ $("start").onclick = async () => {
     topics: keys,
     custom: mine,
     rounds: parseInt($("rounds").value, 10),
-    mock: $("mock").checked
+    mock: $("mock").checked,
+    profile: collectProfile()
   });
   if (!res.ok) {
+    // 没跑起来：去重游标放回去，页面保持原样——上一轮的对话还在下面
+    lastSeq = prevSeq;
     setRunning(false);
     setActivity("");
     notice(res.why || "启动失败", "bad");

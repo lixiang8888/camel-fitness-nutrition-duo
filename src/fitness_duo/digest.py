@@ -3,6 +3,13 @@
 注意：这一步不是第三位智能体。它没有独立人格，也不参与讨论，
 只是一个格式整理环节——把两位教练已经说过的话，压缩成读者能直接用的条文。
 观点全部来自对话本身，整理环节被明确要求不得添加新观点。
+
+读者档案（`reader_facts`）在这里的角色是**取舍镜片，不是内容来源**：
+它只用来判断对话里哪几条与该读者无关（忌口、伤病、作息对不上），
+以及把贴合他目标的那条排在前面。措辞刻意不写任何祈使句——
+一旦出现「请为这位读者给出…」，模型就会开始造对话里没有的东西。
+
+本模块**不认识 `Profile` 这个类型**，只收渲染好的字符串，好单测。
 """
 
 from __future__ import annotations
@@ -22,6 +29,13 @@ EDITOR_SYSTEM = """你是《健身饮食实战手册》的文字编辑。
 4. 两位教练有分歧的地方，必须如实并列写出双方立场，不要擅自调和。
 5. 直接输出 Markdown 正文，不要写「好的」「以下是」这类开场白。
 6. 如果对话里某一点说得不具体、无法执行，就不要写进手册。"""
+
+#: 只在带读者档案时追加到 EDITOR_SYSTEM 后面。
+#: 分成两段常量而不是让模板永远带一个可能为空的占位符——不带档案时
+#: system message 和 prompt 都必须与从前**逐字节相同**。
+EDITOR_SYSTEM_PROFILE_RULE = """
+7. 提示里可能附带「读者档案」。它只用于判断取舍，绝不是内容来源：
+   不得据此新增对话里没有出现的建议、数字或方案。"""
 
 SECTION_TEMPLATE = """议题：{title}
 
@@ -79,6 +93,40 @@ CLOSING_TEMPLATE = """以下是两位教练在收尾讨论中的完整对话，�
  每条必须是能明确判断「做到/没做到」的，不要写「保持好心情」这种无法判定的条目。）"""
 
 
+def _editor_system(with_profile: bool) -> str:
+    """带档案时才追加那条规则，否则 system message 与从前逐字相同。"""
+    if with_profile:
+        return EDITOR_SYSTEM + EDITOR_SYSTEM_PROFILE_RULE
+    return EDITOR_SYSTEM
+
+
+def _reader_section(facts: str, *, closing: bool = False) -> str:
+    """附在 prompt **末尾**的读者档案块。
+
+    两个讲究：
+
+    1. 措辞里**没有一个祈使句**。一旦写成「请为这位读者给出…」，模型就开始造了。
+       这里只授权两件事：把相关的优先保留、把明显不适用的略去或写进「注意」。
+    2. 追加在末尾而不是插在开头，除了让空档案时的 prompt 逐字节不变，
+       还顺带稳住了离线模拟后端——ScriptedBackend 摘的是消息的**前 60 字**，
+       动尾部不影响它。
+    """
+    tail = (
+        "\n\n附录 C 的自检清单要贴着这位读者的训练安排、吃饭方式和忌口来写，"
+        "每一条仍然必须是能明确判断「做到 / 没做到」的。"
+        if closing
+        else ""
+    )
+    return (
+        "\n\n【读者档案 —— 只用于取舍，不是内容来源】\n"
+        f"{facts.strip()}\n\n"
+        "这份档案只描述读者是谁。它唯一的用途是：在上面的对话里挑出与他相关的内容优先保留，\n"
+        "明显不适用于他的可以略去，或写进「注意」。严禁依据档案新增任何对话里没有出现过的\n"
+        "建议、数字或方案——你写下的每一句都必须能在上面的对话里找到出处。"
+        f"{tail}"
+    )
+
+
 def _generate(system: str, prompt: str, backend) -> str:
     agent = ChatAgent(system_message=system, model=backend)
     response = agent.step(prompt)
@@ -86,18 +134,25 @@ def _generate(system: str, prompt: str, backend) -> str:
     return str(msgs[0].content).strip() if msgs else ""
 
 
-def digest_section(topic: Topic, dialogue: str, *, backend) -> str:
+def digest_section(topic: Topic, dialogue: str, *, backend, reader_facts: str = "") -> str:
     prompt = SECTION_TEMPLATE.format(
         title=topic.section_title,
         brief=topic.brief,
         goal=topic.goal,
         dialogue=dialogue,
     )
-    return _generate(EDITOR_SYSTEM, prompt, backend)
+    has_profile = bool(reader_facts.strip())
+    if has_profile:
+        prompt += _reader_section(reader_facts)
+    return _generate(_editor_system(has_profile), prompt, backend)
 
 
-def digest_closing(dialogue: str, *, backend) -> str:
-    return _generate(EDITOR_SYSTEM, CLOSING_TEMPLATE.format(dialogue=dialogue), backend)
+def digest_closing(dialogue: str, *, backend, reader_facts: str = "") -> str:
+    prompt = CLOSING_TEMPLATE.format(dialogue=dialogue)
+    has_profile = bool(reader_facts.strip())
+    if has_profile:
+        prompt += _reader_section(reader_facts, closing=True)
+    return _generate(_editor_system(has_profile), prompt, backend)
 
 
 HEADER = """# 健身饮食实战手册

@@ -60,6 +60,7 @@ def debate_topic(
     rounds: int = 3,
     on_turn: Optional[Callable[[Turn], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    reader_note: str = "",
 ) -> TopicTranscript:
     """让两位教练围绕一个议题对谈若干轮，返回完整记录。
 
@@ -68,13 +69,20 @@ def debate_topic(
 
     `should_stop` 只在**轮次边界**被问到：一次 step() 内部是两次模型调用，
     没法从中间掐断，所以点了停止最坏要等当前这轮 step 返回才收手。
+
+    `reader_note` 是渲染好的读者档案，原样透传给两边的人格。
+    本模块**不认识 Profile 这个类型**——低层只收字符串，好单测。
     """
     assistant_agent = ChatAgent(
-        system_message=build_system_message(NUTRITIONIST, topic.brief, topic.goal),
+        system_message=build_system_message(
+            NUTRITIONIST, topic.brief, topic.goal, reader_note=reader_note
+        ),
         model=backend,
     )
     user_agent = ChatAgent(
-        system_message=build_system_message(COACH, topic.brief, topic.goal),
+        system_message=build_system_message(
+            COACH, topic.brief, topic.goal, reader_note=reader_note
+        ),
         model=backend,
     )
 
