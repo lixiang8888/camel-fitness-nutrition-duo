@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import http.client
 import http.server
 import json
 import socket
@@ -227,12 +228,68 @@ def test_boot_carries_goal_and_crowd_presets(live_server):
 
 
 def test_page_has_run_status(live_server):
-    """跑起来要看得见「没卡死」：当前动作、逐秒计时、发言进度三个位置都得在。"""
+    """跑起来要看得见「没卡死」：当前动作、逐秒计时、发言进度、剩余时间都得在。"""
     _, port = live_server
     html = _get(port, "/")
-    for el in ('id="activity"', 'id="elapsed"', 'id="counter"', 'id="runline"'):
+    for el in ('id="activity"', 'id="elapsed"', 'id="counter"', 'id="runline"', 'id="eta"'):
         assert el in html, f"页面缺少 {el}"
     assert "@keyframes pulse" in html, "运行中的状态点要有动画"
+    # 没有剩余时间估算的话，「慢」和「卡死」在页面上长得一模一样
+    assert "etaText" in html, "页面缺少剩余时间的估算函数"
+
+
+# ---------------------------------------------------------------------------
+# keep-alive 连接不能被没读完的请求体污染
+# ---------------------------------------------------------------------------
+
+def test_early_return_does_not_corrupt_the_keep_alive_connection(live_server):
+    """请求体必须在**任何提前返回之前**读掉。
+
+    protocol_version 是 HTTP/1.1，连接默认复用。没读完的 body 会留在 socket 上，
+    和下一个请求的请求行粘在一起——服务端把「方法」解析成一段 JSON，回一个 501：
+
+        501 Unsupported method ('{"topics":[...]}GET')
+
+    于是这条连接上排队的 /handbook（跑完自动拉手册那一下）拿到的是垃圾：
+    跑成功了，手册页却一片空白。
+    """
+    server, port = live_server
+
+    # 造一个「永远在跑」的 session，让 /start 稳定地走「已经有一轮在跑了」那条提前返回
+    class _NeverFinishes:
+        finished = threading.Event()      # 永不 set
+        handbook = ""
+        handbook_path = None
+
+        def request_stop(self) -> None:
+            pass
+
+    server.session = _NeverFinishes()
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        def call(method: str, path: str, payload: str | None = None):
+            conn.request(method, path, payload, {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            return resp.status, resp.read().decode("utf-8")
+
+        body = json.dumps({"topics": ["baseline"], "rounds": 1, "mock": True})
+
+        status, text = call("POST", "/start", body)
+        assert status == 200 and "已经有一轮在跑了" in text
+
+        # 同一条连接上接着发，必须还能正常应答
+        assert call("GET", "/health")[0] == 200
+
+        # /stop 以前压根不读 body，每一次点「停止」都会留下残渣
+        assert call("POST", "/stop", "{}")[0] == 200
+        assert call("GET", "/health")[0] == 200
+
+        # 未知路径的 POST 也要先把 body 读掉再回 404
+        assert call("POST", "/nope", body)[0] == 404
+        assert call("GET", "/health")[0] == 200
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

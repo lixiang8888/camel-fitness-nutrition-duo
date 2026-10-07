@@ -102,6 +102,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     if args.mock:
         print("!! 模拟模式：不会调用真实模型，产出的是占位内容，没有参考价值。\n")
+    else:
+        # 真实模式很慢，先说清楚要等多久，免得跑到一半以为卡死了。
+        # 只在真实模式这一支打印——模拟模式的输出是黄金回归钉死的。
+        # 每个议题 = 每轮 2 次发言 + 1 次整理，开场白不花调用。
+        calls = len(pipeline.select_topics(args.only)) * (args.rounds * 2 + 1)
+        print(
+            f"真实模式：本次约 {calls} 次模型调用，每次通常十几秒，"
+            f"整轮大约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。\n"
+        )
 
     # 每个 hook 对应原来 _cmd_run 里的每一句 print，顺序与内容逐字不变。
     def run_start(total: int, rounds: int) -> None:

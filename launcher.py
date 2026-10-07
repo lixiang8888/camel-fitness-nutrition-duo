@@ -360,6 +360,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:                      # noqa: N802
         path = self.path.split("?", 1)[0]
+        # 请求体必须在**任何提前返回之前**读掉，这是 HTTP/1.1 keep-alive 的硬要求。
+        # protocol_version 是 HTTP/1.1，连接默认复用；没读完的字节会留在 socket 上，
+        # 和下一个请求的请求行粘在一起。表现是服务端把「方法」解析成一段 JSON：
+        #     501 Unsupported method ('{"topics":[...]}GET')
+        # 于是这条连接上排队的 /handbook（跑完自动拉手册那一下）拿到的是垃圾——
+        # 跑成功了，手册页却可能一片空白。
+        body = self._body()
+
         if path == "/start":
             current = self.server.session
             if current is not None and not current.finished.is_set():
@@ -367,7 +375,6 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "why": "已经有一轮在跑了"})
                 return
 
-            body = self._body()
             keys = [str(k) for k in (body.get("topics") or [])]
             custom = [c for c in (body.get("custom") or []) if isinstance(c, dict)]
             try:
@@ -651,7 +658,8 @@ _PAGE = r"""<!DOCTYPE html>
   }
   @keyframes dots { 0% { content: ""; } 25% { content: "·"; }
                     50% { content: "··"; } 75% { content: "···"; } }
-  #counter, #elapsed { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #counter, #elapsed, #eta { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #eta { color: var(--accent); }
   .mine .tag {
     font-size: 11px; background: #eef2f7; color: var(--muted);
     border-radius: 3px; padding: 1px 5px; margin-left: 4px;
@@ -814,6 +822,7 @@ _PAGE = r"""<!DOCTYPE html>
       <span class="spacer"></span>
       <span id="counter"></span>
       <span id="elapsed"></span>
+      <span id="eta"></span>
     </div>
     <div id="progress"></div>
     <div id="notice"></div>
@@ -864,7 +873,8 @@ function updateHint() {
   $("modehint").className = on ? "hint" : "hint cost";
   $("modehint").textContent = on
     ? "模拟模式：不调用 DeepSeek、不联网、不花钱。产出是占位内容，每条回复几乎一样，仅用来验证流程能跑通。"
-    : "真实模式：会调用 DeepSeek 生成内容，按用量计费。议题数和轮数越多越贵，建议先用模拟模式试。";
+    : "真实模式：调用 DeepSeek，按用量计费，而且慢——默认 6 议题 × 3 轮就是 42 次模型调用，"
+      + "每次通常十几秒，整轮一般要 10 分钟以上。跑起来后右边会显示预计还需多久。";
 }
 
 // ---- 自定义议题 ----
@@ -1188,6 +1198,18 @@ function tickElapsed() {
   const s = Math.floor((Date.now() - startedAt) / 1000);
   const m = Math.floor(s / 60);
   $("elapsed").textContent = "已用 " + (m ? m + " 分 " + (s % 60) + " 秒" : s + " 秒");
+  $("eta").textContent = etaText(s);
+}
+// 一次真实对谈要十几分钟（默认 6 议题 × 3 轮就是 42 次模型调用，每次十几秒）。
+// 没有这个估算，「慢」和「卡死」在页面上长得一模一样——人会在第 4 分钟
+// 放弃一个其实还要再跑 8 分钟的任务。
+// turnsTotal 恰好等于模型调用次数：每个议题 1 条开场（不花调用）+ 每轮 2 条发言，
+// 再加 1 次整理，正好是 1+2×轮数 与 2×轮数+1 相等。
+function etaText(elapsedSec) {
+  if (!turnsTotal || !turnsDone) { return ""; }
+  const left = (turnsTotal - turnsDone) * (elapsedSec / turnsDone);
+  if (left < 45) { return ""; }   // 剩不到一分钟就不报了，免得末段来回跳
+  return "· 预计还需约 " + Math.ceil(left / 60) + " 分钟";
 }
 function setActivity(text, busy) {
   $("activity").textContent = text || "";
@@ -1211,6 +1233,7 @@ function endRun() {
   clearInterval(timerId);
   timerId = null;
   startedAt = 0;
+  $("eta").textContent = "";
 }
 function appendTurn(ev) {
   const empty = $("empty");
@@ -1334,6 +1357,7 @@ $("start").onclick = async () => {
   $("progress").textContent = "";
   $("counter").textContent = "";
   $("elapsed").textContent = "";
+  $("eta").textContent = "";
   showAddForm(false);
   setActivity("启动中", true);
   setRunning(true);
