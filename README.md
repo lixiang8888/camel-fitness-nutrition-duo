@@ -265,7 +265,7 @@ DEEPSEEK_MODEL=moonshot-v1-8k
 
 ## 六、踩坑记录
 
-这三个坑都是本项目实际踩到并修掉的，照抄网上教程大概率会中招：
+这四个坑都是本项目实际踩到并修掉的，照抄网上教程大概率会中招：
 
 **1. `mcp` 版本过新会让 `import camel` 直接崩**
 
@@ -303,6 +303,33 @@ RolePlaying(
 
 另外 `with_task_specify` 默认为 `True`，会在内部再建一个 agent 改写任务，
 与「只有两位智能体」的设定不符，所以关掉。
+
+**4. camel 默认的 token 计数器要联网下载词表，在国内会无限期挂住**
+
+> 症状：网页上**计时器在走，但一句发言都不出来**，也不报错；终端里一条日志都没有。
+
+`ChatAgent` 构造时会向模型后端要 token 计数器，camel 默认去建
+`OpenAITokenCounter`，而它要用 `tiktoken` 加载 `o200k_base` 词表。本地没有词表时，
+tiktoken 会去 `openaipublic.blob.core.windows.net` **下载**——那个域名在国内连不上，
+`requests` 又没设超时，于是**卡死在建 agent 那一步**，模型请求根本没发出去。
+
+更阴的是 tiktoken 把词表缓存在 `/tmp/data-gym-cache`（不是 `~/.cache`），
+重启一次就没了。于是它的表现是「昨天还能跑，今天就不行」；而且**模拟模式一切正常**
+（离线后端自带计数器，绕开了 tiktoken），很容易被误判成业务代码的 bug。
+排查时用 `faulthandler` 打线程栈是最快的——栈顶会直接指到 `tiktoken/load.py:17 read_file`。
+
+修法是给真实后端也注入一个不联网的计数器，顺带设上超时：
+
+```python
+ModelFactory.create(
+    ...,
+    token_counter=OfflineTokenCounter(),   # 见 src/fitness_duo/backends.py
+    timeout=CALL_TIMEOUT,                  # 把「无限期挂住」变成「报错」
+)
+```
+
+`tests/test_pipeline.py` 里有两条测试钉住它。注意那两条是**放进线程再加超时**跑的：
+真回归时这条路径是挂死而不是抛异常，直接调用会把整个测试套件一起拖住。
 
 ---
 

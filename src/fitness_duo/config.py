@@ -16,6 +16,11 @@ load_dotenv(ROOT / ".env")
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
 
+#: 单次请求的超时（秒）。默认没有超时——网络一出问题就是**无限期挂住**，
+#: 页面上只看到计时器在走、没有任何报错，比直接失败难查得多。
+#: 实测单次调用约 17 秒，180 秒留了足够余量，同时保证卡住时能报出来。
+CALL_TIMEOUT = 180.0
+
 
 class MissingApiKey(RuntimeError):
     """没配 key 时给出人话提示，而不是让 openai 抛一长串栈。"""
@@ -45,10 +50,20 @@ def build_backend(*, mock: bool = False, temperature: float = 0.75):
     from camel.models import ModelFactory
     from camel.types import ModelPlatformType
 
+    from .backends import OfflineTokenCounter
+
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
         model_type=os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL),
         api_key=api_key,
         url=os.getenv("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL),
         model_config_dict={"temperature": temperature},
+        # 必须自己给 token_counter，不能让 camel 去建默认的 OpenAITokenCounter：
+        # 它要用 tiktoken 加载 o200k_base 词表，本地没有就联网下载，而那个域名
+        # （openaipublic.blob.core.windows.net）在国内连不上——于是建 ChatAgent
+        # 那一步就**无限期挂住**，模型调用根本没发出去。现场症状是
+        # 「计时器在走，一句发言都没有，也不报错」，而且因为 tiktoken 把词表缓存在
+        # /tmp/data-gym-cache，重启一次就复发，看着像「昨天还好好的今天就不行」。
+        token_counter=OfflineTokenCounter(),
+        timeout=CALL_TIMEOUT,
     )
