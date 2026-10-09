@@ -15,3 +15,8 @@ outputs/*.json
 # Windows 快捷方式 —— make_shortcut.py 本该把它建在桌面上，掉在项目根目录的是误产物。
 # 而且它内嵌本机发行版名和绝对路径，换台机器就失效，仓库又是公开的，绝不提交。
 *.lnk
+
+# 建成分表时从上游下载的原始 JSON（见 tools/build_food_table.py）。
+# 上游仓库没有 license，等于保留所有权利；仓库又是公开的，绝不提交。
+# 只有由它派生出的 food_composition.csv 会进仓库，那份每行都带原书编码可回溯。
+tools/.cache/

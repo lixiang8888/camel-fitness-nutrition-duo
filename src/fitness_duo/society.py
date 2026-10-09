@@ -18,6 +18,7 @@ from typing import Callable, Optional
 from camel.agents import ChatAgent
 from camel.societies import RolePlaying
 
+from .fooddata import build_food_tools
 from .personas import COACH, NUTRITIONIST, build_system_message
 from .topics import Topic
 
@@ -72,18 +73,27 @@ def debate_topic(
 
     `reader_note` 是渲染好的读者档案，原样透传给两边的人格。
     本模块**不认识 Profile 这个类型**——低层只收字符串，好单测。
+
+    两位各配一套 `fooddata` 的查表工具（见 fooddata.build_food_tools）。
+    工具调用是模型自己发起的，所以**离线模拟后端不会产生任何工具调用**——
+    ScriptedBackend 只回固定文本。档案、议题、工具三者互不依赖，
+    这一点让「模拟模式跑通整条链路」这个保证在加了工具之后依然成立。
     """
+    # 两位各自拿一份工具，不共用实例。成分表是只读的，共用本来也没事，
+    # 但 CAMEL 的 tool 对象在 agent 内部会被引用，分开建省得将来出怪事。
     assistant_agent = ChatAgent(
         system_message=build_system_message(
             NUTRITIONIST, topic.brief, topic.goal, reader_note=reader_note
         ),
         model=backend,
+        tools=build_food_tools(),
     )
     user_agent = ChatAgent(
         system_message=build_system_message(
             COACH, topic.brief, topic.goal, reader_note=reader_note
         ),
         model=backend,
+        tools=build_food_tools(),
     )
 
     society = RolePlaying(
