@@ -148,6 +148,9 @@ class _Session:
         self.finished = threading.Event()
         self.handbook = ""
         self.handbook_path: Path | None = None
+        #: 速查版：完整手册压成的一页。模型没产出时两者都空，页面上就不显示那一块。
+        self.quick = ""
+        self.quick_path: Path | None = None
         self._thread: threading.Thread | None = None
 
     # ---- hooks：全在 worker 线程里被 pipeline 调用 ----
@@ -209,6 +212,11 @@ class _Session:
                 "closing": is_closing,
             })
 
+        def quick_start() -> None:
+            # 这一趟又是一次十几秒的模型调用。不报的话，最后这段时间页面会停在
+            # 「已整理出附录」上不动——正是这个项目一直在防的「像卡死」。
+            bus.publish({"type": "quick_start"})
+
         return pipeline.PipelineHooks(
             on_run_start=run_start,
             on_topic_start=topic_start,
@@ -216,6 +224,7 @@ class _Session:
             on_topic_done=topic_done,
             on_section_start=section_start,
             on_section_done=section_done,
+            on_quick_start=quick_start,
         )
 
     # ---- 生命周期 ----
@@ -238,6 +247,8 @@ class _Session:
             )
             self.handbook = result.handbook
             self.handbook_path = result.handbook_path
+            self.quick = result.quick
+            self.quick_path = result.quick_path
             self.bus.publish({
                 "type": "run_done",
                 "transcript": str(result.transcript_path),
@@ -281,6 +292,20 @@ class _Session:
 # ---------------------------------------------------------------------------
 # 3. HTTP
 # ---------------------------------------------------------------------------
+
+def _pick_doc(session, *, quick: bool) -> tuple[str, Path | None]:
+    """取这一轮的某一份产物：速查版或完整手册。
+
+    `/handbook` 与 `/quick`、`/handbook.md` 与 `/quick.md` 只差这一个开关，
+    所以两条路由共用它——不然「网页上看到的」和「下载到的」会各写一份取数逻辑，
+    正是这个项目一直在躲的那种对不上。
+    """
+    if session is None:
+        return "", None
+    if quick:
+        return session.quick, session.quick_path
+    return session.handbook, session.handbook_path
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "FitnessDuoLauncher"
@@ -333,22 +358,22 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"app": _APP_ID, "running": running})
         elif path == "/events":
             self._stream()
-        elif path == "/handbook":
+        elif path in ("/handbook", "/quick"):
             session = self.server.session
-            self._json({
-                "markdown": session.handbook if session else "",
-                "path": str(session.handbook_path) if session and session.handbook_path else "",
-            })
-        elif path == "/handbook.md":
+            text, target = _pick_doc(session, quick=path == "/quick")
+            self._json({"markdown": text, "path": str(target) if target else ""})
+        elif path in ("/handbook.md", "/quick.md"):
+            quick = path == "/quick.md"
             session = self.server.session
-            if session is None or not session.handbook:
+            text, target = _pick_doc(session, quick=quick)
+            if not text:
                 # 消息必须是 ASCII：http.server 按 latin-1 编码状态行，中文会直接抛
                 # UnicodeEncodeError，把 handler 干掉，而不是干净地返回 404。
-                self.send_error(404, "No handbook yet")
+                self.send_error(404, "No quick version yet" if quick else "No handbook yet")
                 return
-            name = session.handbook_path.name if session.handbook_path else "handbook.md"
+            name = target.name if target else path.lstrip("/")
             self._send(
-                session.handbook.encode("utf-8"),
+                text.encode("utf-8"),
                 "text/markdown; charset=utf-8",
                 filename=name,
             )
@@ -640,6 +665,8 @@ _PAGE = r"""<!DOCTYPE html>
   }
   #hb hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
   #hb pre { white-space: pre-wrap; word-wrap: break-word; font-size: 13px; }
+  /* 速查版和完整版是两份文件，两个下载按钮得跟各自的正文挂在一起 */
+  #hb p.hbmove { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--border); }
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
          background: var(--muted); margin-right: 6px; vertical-align: 1px; }
   /* 跑一轮要等模型，几十秒没有任何变化最容易让人以为卡死了。
@@ -1298,6 +1325,12 @@ function handle(ev) {
     setActivity(ev.closing ? "正在整理分歧备忘与自检清单" : "正在把这一节整理成手册", true);
     setStatus("整理中", "live");
     $("progress").textContent += ev.closing ? "　→ 整理附录中" : "　→ 整理成章节中";
+  } else if (ev.type === "quick_start") {
+    // 最后还有一次模型调用（把整本手册压成一页速查）。不报的话，
+    // 这段时间页面会停在「已整理出附录」上不动。
+    setActivity("正在把整本手册压成一页速查", true);
+    setStatus("压缩中", "live");
+    $("progress").textContent += "　→ 正在生成一页速查";
   } else if (ev.type === "notice") {
     notice(ev.text, ev.kind === "warning" ? "bad" : "");
     if (ev.kind === "warning") { setStatus("出错了", "bad"); }
@@ -1427,26 +1460,46 @@ function mdToHtml(md) {
   closeList();
   return out.join("\n");
 }
-let hbRaw = "";
+let hbRaw = "", quickRaw = "";
 async function loadHandbook() {
-  const res = await (await fetch("/handbook")).json();
-  hbRaw = res.markdown || "";
-  if (!hbRaw.trim()) { return; }
+  // 两份一起取：速查版排在完整版前面，缺了哪份都不该让整页空白
+  const [hb, qk] = await Promise.all([
+    (await fetch("/handbook")).json(),
+    (await fetch("/quick")).json(),
+  ]);
+  hbRaw = hb.markdown || "";
+  quickRaw = qk.markdown || "";
+  if (!hbRaw.trim() && !quickRaw.trim()) { return; }
+  renderHandbook(false);
+}
+function hbActions(rawMode) {
+  return '<p class="hbmove">' +
+    (quickRaw.trim() ? '<button id="dlq">下载速查版 .md</button> ' : "") +
+    '<button id="dl">下载完整版 .md</button> ' +
+    (rawMode ? '<button id="render">看渲染版</button>' : '<button id="raw">查看原文</button>') +
+    "</p>";
+}
+function bindHbActions() {
+  if ($("dlq")) { $("dlq").onclick = () => { window.location = "/quick.md"; }; }
+  if ($("dl")) { $("dl").onclick = () => { window.location = "/handbook.md"; }; }
+  if ($("raw")) { $("raw").onclick = () => renderHandbook(true); }
+  if ($("render")) { $("render").onclick = () => renderHandbook(false); }
+}
+// 速查版在上、完整版在下：这一页就是给「不想读完整版」的人准备的，
+// 所以不能藏在第二个 tab 或者折叠块里。
+function renderHandbook(rawMode) {
   const warn = $("mock").checked
     ? '<div class="mockwarn">模拟模式下这份「手册」是占位内容：没有真实营养学结论，' +
-      '而且整理环节同样走的是模拟后端，所以它没有标题层级——不是渲染坏了。</div>'
+      '每条回复也几乎一样——不是渲染坏了。</div>'
     : "";
-  $("hb").innerHTML = warn + mdToHtml(hbRaw) +
-    '<p style="margin-top:18px"><button id="dl">下载 .md</button> ' +
-    '<button id="raw">查看原文</button></p>';
-  $("dl").onclick = () => { window.location = "/handbook.md"; };
-  $("raw").onclick = () => {
-    $("hb").innerHTML = warn + '<pre>' + esc(hbRaw) + "</pre>" +
-      '<p style="margin-top:18px"><button id="dl">下载 .md</button> ' +
-      '<button id="raw2">看渲染版</button></p>';
-    $("dl").onclick = () => { window.location = "/handbook.md"; };
-    $("raw2").onclick = loadHandbook;
-  };
+  let body;
+  if (rawMode) {
+    body = "<pre>" + esc(quickRaw.trim() ? quickRaw.trim() + "\n\n---\n\n" + hbRaw : hbRaw) + "</pre>";
+  } else {
+    body = (quickRaw.trim() ? mdToHtml(quickRaw) + "<hr>" : "") + mdToHtml(hbRaw);
+  }
+  $("hb").innerHTML = warn + body + hbActions(rawMode);
+  bindHbActions();
 }
 
 // ---- Tab ----

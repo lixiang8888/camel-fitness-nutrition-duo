@@ -105,8 +105,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         # 真实模式很慢，先说清楚要等多久，免得跑到一半以为卡死了。
         # 只在真实模式这一支打印——模拟模式的输出是黄金回归钉死的。
-        # 每个议题 = 每轮 2 次发言 + 1 次整理，开场白不花调用。
-        calls = len(pipeline.select_topics(args.only)) * (args.rounds * 2 + 1)
+        # 每个议题 = 每轮 2 次发言 + 1 次整理，开场白不花调用；末尾再花 1 次压速查版。
+        calls = len(pipeline.select_topics(args.only)) * (args.rounds * 2 + 1) + 1
         print(
             f"真实模式：本次约 {calls} 次模型调用，每次通常十几秒，"
             f"整轮大约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。\n"
@@ -123,6 +123,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     def run_done(result: pipeline.RunResult) -> None:
         print(f"\n对话实录：{result.transcript_path}")
         print(f"成果手册：{result.handbook_path}")
+        # 模型没吐出速查版时不落盘，这里也就不提——不能指着一个不存在的文件
+        if result.quick_path:
+            print(f"一页速查：{result.quick_path}")
 
     hooks = pipeline.PipelineHooks(
         on_run_start=run_start,

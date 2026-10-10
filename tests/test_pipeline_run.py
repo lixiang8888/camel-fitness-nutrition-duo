@@ -200,6 +200,13 @@ def test_run_pipeline_writes_files(backend, tmp_path):
     assert "不构成医疗建议" in result.handbook
     assert "模拟模式生成的占位手册" in result.handbook
 
+    assert result.quick_path is not None and result.quick_path.exists()
+    assert result.quick_path.name.startswith("quick-")
+    assert result.quick_path.name.endswith(".mock.md")
+    # 速查版是会被单独打开、单独转发的那一份，免责声明必须跟着它走
+    assert "不构成医疗建议" in result.quick
+    assert "占位速查" in result.quick
+
 
 def test_run_pipeline_without_mock_has_no_suffix(backend, tmp_path):
     result = pipeline.run_pipeline(
@@ -222,6 +229,8 @@ def test_run_pipeline_emits_hooks_in_order(backend, tmp_path):
         on_topic_done=lambda topic, tr: seen.append(f"topic_done:{topic.key}:{len(tr.turns)}"),
         on_section_start=lambda topic, closing: seen.append(f"section_start:{topic.key}:{closing}"),
         on_section_done=lambda topic, closing, md: seen.append(f"section_done:{topic.key}:{closing}"),
+        on_quick_start=lambda: seen.append("quick_start"),
+        on_quick_done=lambda md: seen.append(f"quick_done:{bool(md.strip())}"),
         on_run_done=lambda result: seen.append("run_done"),
     )
 
@@ -251,6 +260,9 @@ def test_run_pipeline_emits_hooks_in_order(backend, tmp_path):
         "topic_done:closing:3",
         "section_start:closing:True",
         "section_done:closing:True",
+        # 速查版排在所有议题之后、落盘之前——它读的是拼好的整本手册
+        "quick_start",
+        "quick_done:True",
         "run_done",
     ]
 
@@ -314,6 +326,63 @@ def test_run_pipeline_closing_sees_all_previous_dialogue(backend, tmp_path, monk
     assert "我的做法是：花两周时间称重记录" in context  # baseline 的开场白
     assert "外卖优先选能看清食材构成的" in context  # reality 的开场白
     assert "哪些结论是我们都真的认同的" in context  # 收尾议题自己也参与了
+
+
+# ---------------------------------------------------------------------------
+# 速查版（完整手册压成的一页）
+# ---------------------------------------------------------------------------
+
+def test_quick_is_compressed_from_the_finished_handbook(backend, tmp_path, monkeypatch):
+    """速查版的输入必须是**拼好的完整手册**，不是对话、也不是各节正文。
+
+    这是这一节唯一真正重要的不变量：只要压缩的输入是成品，速查版里就不可能出现
+    完整版没有的说法，两份文件也不可能互相矛盾。喂对话进去就丢掉这条保证了。
+    """
+    seen: dict[str, str] = {}
+
+    def spy(handbook: str, *, backend):
+        seen["input"] = handbook
+        return "## 你的数字\n- 2000 千卡"
+
+    monkeypatch.setattr(digest, "digest_quick", spy)
+
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True,
+    )
+
+    assert seen["input"] == result.handbook
+
+
+def test_quick_header_points_at_the_full_handbook(backend, tmp_path):
+    """两份文件会一起躺在 outputs/ 里，速查版得说清自己是从哪份压出来的。"""
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True,
+    )
+    assert result.handbook_path.name in result.quick
+    assert "速查版" in result.quick
+
+
+def test_quick_skipped_when_the_model_returns_nothing(backend, tmp_path, monkeypatch):
+    """模型没吐出东西时只交付完整版——比落一个几乎空白的文件干净。
+
+    命令行那边也不能提一个不存在的文件，所以 quick_path 是 None 而不是某个路径。
+    """
+    monkeypatch.setattr(digest, "digest_quick", lambda handbook, *, backend: "   \n")
+    seen: list[str] = []
+
+    result = pipeline.run_pipeline(
+        backend=backend, rounds=1, topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path, mock=True,
+        hooks=pipeline.PipelineHooks(on_quick_done=lambda md: seen.append(md)),
+    )
+
+    assert result.quick == "" and result.quick_path is None
+    assert [p.name for p in tmp_path.iterdir()] == sorted(
+        [result.handbook_path.name, result.transcript_path.name]
+    )
+    assert seen == [""]
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +479,7 @@ def test_goal_key_lands_in_the_filename(backend, tmp_path, prof):
     assert "-fat_loss" in result.handbook_path.name
     assert "-fat_loss" in result.transcript_path.name
     assert result.handbook_path.name.endswith(".mock.md")
+    assert result.quick_path is not None and "-fat_loss" in result.quick_path.name
 
 
 def test_filename_has_no_slug_without_a_goal(backend, tmp_path):
@@ -528,6 +598,9 @@ _GOLDEN = [
     "",
     "对话实录：<OUT>/transcript-<STAMP>.mock.md",
     "成果手册：<OUT>/handbook-<STAMP>.mock.md",
+    # 加「速查版」时**有意**多出这一行（黄金回归不是不许改，是不许悄悄改：
+    # 改它就得先想清楚终端输出该长什么样）。
+    "一页速查：<OUT>/quick-<STAMP>.mock.md",
 ]
 
 

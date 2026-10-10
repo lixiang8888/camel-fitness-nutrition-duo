@@ -174,6 +174,47 @@ def test_handbook_download_404_before_any_run(live_server):
     assert exc.value.code == 404
 
 
+def test_quick_empty_before_any_run(live_server):
+    _, port = live_server
+    assert json.loads(_get(port, "/quick"))["markdown"] == ""
+
+
+def test_quick_download_404_before_any_run(live_server):
+    """速查版是另一份文件，得有自己的下载口——它才是「一页纸」那份。"""
+    _, port = live_server
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(port, "/quick.md")
+    assert exc.value.code == 404
+
+
+def test_handbook_and_quick_do_not_get_swapped(live_server):
+    """两条路由只差一个开关，最容易出的错是把两份内容对调。
+
+    网页上读到的和下载到的必须是同一份——不然「页面上是速查版、下下来是完整版」
+    这种事没人会立刻发现。
+    """
+    from pathlib import Path
+
+    server, port = live_server
+
+    class _Done:
+        finished = threading.Event()
+        handbook = "# 完整手册\n正文甲"
+        handbook_path = Path("/tmp/handbook-1-fat_loss.md")
+        quick = "# 速查版\n正文乙"
+        quick_path = Path("/tmp/quick-1-fat_loss.md")
+
+    server.session = _Done()
+
+    assert json.loads(_get(port, "/handbook"))["markdown"] == _Done.handbook
+    assert json.loads(_get(port, "/quick"))["markdown"] == _Done.quick
+    assert json.loads(_get(port, "/quick"))["path"].endswith("quick-1-fat_loss.md")
+
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/quick.md", timeout=3) as resp:
+        assert resp.read().decode("utf-8") == _Done.quick
+        assert "quick-1-fat_loss.md" in resp.headers["Content-Disposition"]
+
+
 def test_unknown_path_404(live_server):
     _, port = live_server
     with pytest.raises(urllib.error.HTTPError) as exc:
@@ -236,6 +277,19 @@ def test_page_has_run_status(live_server):
     assert "@keyframes pulse" in html, "运行中的状态点要有动画"
     # 没有剩余时间估算的话，「慢」和「卡死」在页面上长得一模一样
     assert "etaText" in html, "页面缺少剩余时间的估算函数"
+
+
+def test_page_offers_both_versions(live_server):
+    """手册页要同时交付两份：速查版在上、完整版在下，各有各的下载按钮。
+
+    速查版不能藏进第二个 tab 或折叠块——它就是给「不想读完整版」的人准备的，
+    多一次点击就等于没做。
+    """
+    _, port = live_server
+    html = _get(port, "/")
+    for s in ('"/quick"', '"/quick.md"', "下载速查版", "下载完整版"):
+        assert s in html, f"页面缺少 {s}"
+    assert "正在把整本手册压成一页速查" in html, "压缩这一步也要有状态提示"
 
 
 # ---------------------------------------------------------------------------

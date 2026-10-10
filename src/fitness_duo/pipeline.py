@@ -1,4 +1,4 @@
-"""完整流程的编排：对谈 → 整理 → 出手册。
+"""完整流程的编排：对谈 → 整理 → 出手册 → 再压出一页速查。
 
 这个模块把「跑什么」和「怎么展示」分开。它自己不打印任何东西、也不碰浏览器，
 只按顺序调用 society / digest，并在关键节点上回调 `PipelineHooks` 里挂的函数。
@@ -50,6 +50,10 @@ class RunResult:
     transcripts: "tuple[TopicTranscript, ...]"
     sections: tuple[str, ...]
     closing: str
+    #: 速查版（完整手册压成的一页）。模型没吐出东西时 quick 是空串、路径是 None，
+    #: 这一轮就只交付完整版——比落一个空文件干净。
+    quick_path: Optional[Path]
+    quick: str
 
 
 @dataclass
@@ -73,6 +77,10 @@ class PipelineHooks:
     on_section_start: Optional[Callable[[Topic, bool], None]] = None
     # (议题, 是不是收尾议题, 整理出来的 markdown)
     on_section_done: Optional[Callable[[Topic, bool, str], None]] = None
+    # () —— 开始把整本手册压成一页速查（真实模式下这又是一次十几秒的等待）
+    on_quick_start: Optional[Callable[[], None]] = None
+    # (速查版的 markdown；没产出就是空串)
+    on_quick_done: Optional[Callable[[str], None]] = None
     # (最终结果)
     on_run_done: Optional[Callable[[RunResult], None]] = None
 
@@ -274,10 +282,28 @@ def run_pipeline(
 
     handbook = digest.assemble(sections, closing, header=header)
 
+    # 速查版在完整版之后生成，喂进去的就是上面这份拼好的手册——
+    # 它因此不可能写出完整版里没有的东西，两份文件也不会互相矛盾。
+    if h.on_quick_start:
+        h.on_quick_start()
+    quick_body = digest.digest_quick(handbook, backend=backend)
+    quick = ""
+    quick_path: Optional[Path] = None
+    if quick_body.strip():
+        quick_path = out / f"quick-{stamp}{slug}{suffix}.md"
+        quick_header = digest.QUICK_HEADER.format(full=handbook_path.name)
+        if mock:
+            quick_header = "> ⚠️ **这是模拟模式生成的占位速查，不含任何真实营养学内容。**\n\n" + quick_header
+        quick = digest.assemble_quick(quick_body, header=quick_header)
+    if h.on_quick_done:
+        h.on_quick_done(quick)
+
     transcript_path.write_text(
         "\n\n".join(t.to_markdown() for t in transcripts), encoding="utf-8"
     )
     handbook_path.write_text(handbook, encoding="utf-8")
+    if quick_path:
+        quick_path.write_text(quick, encoding="utf-8")
 
     result = RunResult(
         transcript_path=transcript_path,
@@ -286,6 +312,8 @@ def run_pipeline(
         transcripts=tuple(transcripts),
         sections=tuple(sections),
         closing=closing,
+        quick_path=quick_path,
+        quick=quick,
     )
     if h.on_run_done:
         h.on_run_done(result)

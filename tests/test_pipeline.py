@@ -113,6 +113,41 @@ def test_assemble_puts_everything_together():
     assert "不构成医疗建议" in handbook
 
 
+def test_assemble_quick_keeps_the_disclaimer():
+    """免责声明必须跟着速查版走。
+
+    它是「一页纸」——正因如此最容易被单独转出去，所以那句话不能只留在完整版里。
+    """
+    quick = digest.assemble_quick("## 你的数字\n- 2000 千卡", header="# 手册 · 速查版")
+    assert "2000 千卡" in quick
+    assert "# 手册 · 速查版" in quick
+    assert "不构成医疗建议" in quick
+
+
+def test_quick_prompt_feeds_the_handbook_and_forbids_additions(backend, monkeypatch):
+    """压缩那一步的提示里，手册全文和「只许删不许加」得同时在场。"""
+    captured: dict[str, str] = {}
+    real = digest.ChatAgent
+
+    def spy_agent(*, system_message, model):
+        captured["system"] = system_message
+        agent = real(system_message=system_message, model=model)
+        inner = agent.step
+
+        def step(prompt):
+            captured["prompt"] = prompt
+            return inner(prompt)
+
+        agent.step = step
+        return agent
+
+    monkeypatch.setattr(digest, "ChatAgent", spy_agent)
+    digest.digest_quick("# 完整手册\n正文甲", backend=backend)
+
+    assert "# 完整手册\n正文甲" in captured["prompt"]
+    assert "严禁添加完整手册里没有的" in captured["system"]
+
+
 def test_mock_backend_never_claims_to_be_real(backend):
     """模拟后端必须在回复里自我标注，避免被误当成真实产出。"""
     transcript = society.debate_topic(TOPICS[0], backend=backend, rounds=1)
