@@ -288,7 +288,7 @@ def norm(value: object) -> str:
     """成分表里的占位符归一成数字。
 
     原书用 `Tr` 表示微量、`—` 表示未测定、`un` 表示未知，数字后面带 `*`
-    表示这是计算值。这些都写成 0，并在 README 里说明——留着原样会让
+    表示这是计算值。这些都写成 0，并在 docs/ENGINEERING.md 里说明——留着原样会让
     CSV 的列一半是字符串一半是数字，Excel 里没法排序。
     """
     if value is None:

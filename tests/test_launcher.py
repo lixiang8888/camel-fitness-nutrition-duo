@@ -2,7 +2,7 @@
 
 只测确定性、不需要人眼的部分：事件总线、单实例识别、页面注入。
 「起服务 + 开浏览器 + 线程」那条整链路不做 pytest（脆且没必要），
-靠手工端到端点一遍——见 README 的「网页版」一节。
+靠手工端到端点一遍——见 docs/ENGINEERING.md 的「网页版」一节。
 """
 
 from __future__ import annotations
