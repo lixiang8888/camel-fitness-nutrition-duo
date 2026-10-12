@@ -184,12 +184,21 @@ def run_pipeline(
     hooks: Optional[PipelineHooks] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     profile: Optional[Profile] = None,
+    converge: bool = True,
 ) -> RunResult:
     """跑完整流程。产物全部跑完才落盘，中途抛异常或喊停都不留半成品。
 
     `should_stop` 的检查点只有两处：议题开始前、某个议题对谈结束后。
     所以喊停最坏要等当前这一轮对谈跑完（society.step() 内部是两次模型调用，
     没法从中间掐断）。
+
+    `converge` 决定「教练没有新的反对意见就提前收手」要不要开（`rounds` 因此
+    是上限而非定额）。**mock 模式下恒关**，两个原因：ScriptedBackend 只吐固定
+    模板、根本不会说那句话，开着也只是白费判断；更重要的是 mock 的职责就是
+    证明「循环确实跑满了 N 轮」，让它在轮数上变来变去会让那条保证失效。
+
+    所以本模块是**唯一**把「mock」翻译成「关掉收手」的地方：society 只认
+    `early_stop` 这个语义参数，它不认识 mock，也不该认识。
 
     `profile` 是读者档案。**本模块是唯一认识 Profile 的地方**：往下传的
     是它渲染好的两段字符串（给两位教练的 / 进手册的），society 和 digest
@@ -233,6 +242,7 @@ def run_pipeline(
             on_turn=(lambda t, _topic=topic: h.on_turn(_topic, t)) if h.on_turn else None,
             should_stop=should_stop,
             reader_note=reader_note,
+            early_stop=converge and not mock,
         )
         transcripts.append(transcript)
         if h.on_topic_done:

@@ -87,6 +87,18 @@ def _profile_from_args(args: argparse.Namespace) -> Optional[Profile]:
     return None if reader.is_empty() else reader
 
 
+def _topic_done_line(transcript) -> str:
+    """某个议题谈完时那两行（第二行只在提前收手时出现）。
+
+    单独拎成函数是为了能不起服务、不联网地单测——它同时也是「mock 的终端输出
+    逐字不变」这条保证的落点：没提前收手时返回的字符串必须和从前一模一样。
+    """
+    line = f"    对话完成，共 {len(transcript.turns)} 条发言"
+    if transcript.stopped_early:
+        line += f"\n    ↑ 教练已无新的反对意见，第 {transcript.rounds_run} 轮后提前收手"
+    return line
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     try:
         reader = _profile_from_args(args)
@@ -106,10 +118,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # 真实模式很慢，先说清楚要等多久，免得跑到一半以为卡死了。
         # 只在真实模式这一支打印——模拟模式的输出是黄金回归钉死的。
         # 每个议题 = 每轮 2 次发言 + 1 次整理，开场白不花调用；末尾再花 1 次压速查版。
+        # 这是**上限**：教练没有新的反对意见时该议题会提前收手，实际比这少。
         calls = len(pipeline.select_topics(args.only)) * (args.rounds * 2 + 1) + 1
         print(
-            f"真实模式：本次约 {calls} 次模型调用，每次通常十几秒，"
-            f"整轮大约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。\n"
+            f"真实模式：本次最多约 {calls} 次模型调用，每次通常十几秒，"
+            f"最多约 {max(1, round(calls * 16 / 60))} 分钟。跑的过程中会逐条打印进展。\n"
         )
 
     # 每个 hook 对应原来 _cmd_run 里的每一句 print，顺序与内容逐字不变。
@@ -118,7 +131,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # 只在填了档案时才多这一行——没填档案的终端输出必须逐字不变
         if reader is not None:
             print(f"档案：{reader.summary()}")
-        print(f"议题数：{total}，每个议题 {rounds} 轮\n")
+        # 「最多」只在真实模式说：模拟模式恒不收手，那儿 rounds 就是定额，
+        # 而且模拟模式的输出是黄金回归钉死的，一个字都不能动。
+        if args.mock:
+            print(f"议题数：{total}，每个议题 {rounds} 轮\n")
+        else:
+            print(
+                f"议题数：{total}，每个议题最多 {rounds} 轮"
+                f"（上限；教练没有新的反对意见会提前收手）\n"
+            )
 
     def run_done(result: pipeline.RunResult) -> None:
         print(f"\n对话实录：{result.transcript_path}")
@@ -133,9 +154,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             f"[{index}/{total}] {topic.section_title}"
         ),
         on_turn=lambda topic, turn: print(f"    · {turn.speaker} 发言 {len(turn.content)} 字"),
-        on_topic_done=lambda topic, transcript: print(
-            f"    对话完成，共 {len(transcript.turns)} 条发言"
-        ),
+        on_topic_done=lambda topic, transcript: print(_topic_done_line(transcript)),
         on_section_done=lambda topic, is_closing, markdown: print(
             "    已整理出附录" if is_closing else "    已整理成手册章节"
         ),
@@ -150,6 +169,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         mock=args.mock,
         hooks=hooks,
         profile=reader,
+        converge=args.converge,
     )
     return 0
 
@@ -162,7 +182,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
 
     run = sub.add_parser("run", help="跑完整流程：对谈 → 整理 → 出手册")
-    run.add_argument("--rounds", type=int, default=3, help="每个议题的对谈轮数（默认 3）")
+    run.add_argument(
+        "--rounds", type=int, default=3, help="每个议题的对谈轮数上限（默认 3）"
+    )
+    run.add_argument(
+        "--no-converge", dest="converge", action="store_false",
+        help="跑满每个议题的轮数，不做「教练没有新的反对意见就提前收手」的判断",
+    )
     run.add_argument("--mock", action="store_true", help="离线模拟，不调用真实模型")
     run.add_argument("--only", default="", help="只跑指定议题，逗号分隔，如 baseline,reality")
     run.add_argument("--out", type=Path, default=None, help="产物输出目录（默认 outputs/）")

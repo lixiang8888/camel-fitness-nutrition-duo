@@ -52,9 +52,13 @@ uv run fitness-duo run         # 4. 正式跑，产出真手册
 ```bash
 uv run fitness-duo topics                       # 看议题表
 uv run fitness-duo goals                        # 看能填的目标与处境
-uv run fitness-duo run --rounds 5               # 每个议题多吵几轮
+uv run fitness-duo run --rounds 5               # 每个议题最多吵几轮
+uv run fitness-duo run --no-converge            # 跑满，不做「谈拢了就收手」的判断
 uv run fitness-duo run --only baseline,reality  # 只跑指定议题
 ```
+
+`--rounds` 是**上限**：教练对当前方案已经提不出新的反对意见时，那个议题就提前收手
+（终端和对话实录里都会写明第几轮收的）。想要每个议题都跑满，加 `--no-converge`。
 
 **给一个人写**（不填档案则面向所有人）：
 

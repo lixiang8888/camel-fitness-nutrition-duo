@@ -94,6 +94,117 @@ def test_debate_rounds_are_configurable(backend):
     assert len(transcript.turns) == 1 + 4 * 2
 
 
+# ---------------------------------------------------------------------------
+# 提前收手：教练没有新的反对意见时，rounds 是上限而不是定额
+#
+# 调用次序是固定的，这一点是下面几个假后端的地基：开场白不花模型调用，之后
+# 每轮先教练（user agent）后营养师（assistant agent），所以**奇数调用都是教练**。
+# ---------------------------------------------------------------------------
+
+class ConcedingBackend(ScriptedBackend):
+    """第 2 轮起，教练（奇数调用）只回一句「无异议」，其他照旧。"""
+
+    def _reply(self, messages):
+        self._calls += 1
+        if self._calls >= 3 and self._calls % 2 == 1:
+            return society.NO_MORE_OBJECTION
+        return f"[假后端] 第 {self._calls} 次调用，这里本应是一段具体论证。"
+
+
+class VerboselyConcedingBackend(ScriptedBackend):
+    """每轮都回一长段，**其中包含**「无异议」字样——但它明显还有话说。"""
+
+    def _reply(self, messages):
+        self._calls += 1
+        return (
+            f"{society.NO_MORE_OBJECTION}——不过我还是有两点想补充："
+            "第一，这个方案的执行成本你算过没有；第二，加班到十点的人怎么办。"
+        )
+
+
+def test_early_stop_is_off_by_default(backend):
+    """默认关。直调 debate_topic 的既有行为必须逐字不变。"""
+    transcript = society.debate_topic(TOPICS[0], backend=backend, rounds=4)
+
+    assert len(transcript.turns) == 1 + 4 * 2
+    assert transcript.stopped_early is False
+    assert transcript.planned_rounds == 4
+
+
+def test_concession_stops_the_debate():
+    transcript = society.debate_topic(
+        TOPICS[0], backend=ConcedingBackend(), rounds=4, early_stop=True
+    )
+
+    # 开场 + 2 整轮。触发收手的那一轮也是完整的：camel 的一轮往返
+    # （教练先说、营养师后答）中途掐不断，所以收手总落在轮次边界上。
+    assert len(transcript.turns) == 1 + 2 * 2
+    assert transcript.stopped_early is True
+    assert transcript.rounds_run == 2
+    assert transcript.planned_rounds == 4
+
+
+def test_concession_is_recorded_not_dropped():
+    """宣布收手的那一句必须留在记录里——先 record 再判断，不丢字。"""
+    transcript = society.debate_topic(
+        TOPICS[0], backend=ConcedingBackend(), rounds=4, early_stop=True
+    )
+
+    concession = [t for t in transcript.turns if t.content == society.NO_MORE_OBJECTION]
+    assert len(concession) == 1
+    assert concession[0].speaker == COACH.name
+
+    markdown = transcript.to_markdown()
+    assert "收手" in markdown
+    # 喂给整理环节的是纯对话，收手这件事不能渗进去——否则 digest 会自己加话
+    assert "收手" not in transcript.as_dialogue()
+
+
+def test_min_rounds_floor_protects_the_first_exchange():
+    """第 1 轮是「教练挑刺 + 营养师回应」，是最小的有效交锋，不许砍。"""
+    transcript = society.debate_topic(
+        TOPICS[0], backend=ConcedingBackend(), rounds=2, early_stop=True
+    )
+
+    assert transcript.stopped_early is False
+    assert len(transcript.turns) == 1 + 2 * 2
+
+
+def test_a_long_turn_merely_containing_the_token_does_not_count():
+    """宁可漏判（多花一轮的钱），也不能误判（把一整段发言抹掉）。"""
+    transcript = society.debate_topic(
+        TOPICS[0],
+        backend=VerboselyConcedingBackend(),
+        rounds=4,
+        early_stop=True,
+    )
+
+    assert transcript.stopped_early is False
+    assert len(transcript.turns) == 1 + 4 * 2
+
+
+def test_scripted_backend_never_trips_the_concession():
+    """模拟后端的固定模板里没有那句话——这正是 pipeline 关掉它的底气。
+
+    表征测试：将来谁把 mock 的文案改成含「无异议」，这条会先红。
+    """
+    transcript = society.debate_topic(
+        TOPICS[0], backend=ScriptedBackend(), rounds=4, early_stop=True
+    )
+
+    assert transcript.stopped_early is False
+    assert len(transcript.turns) == 1 + 4 * 2
+
+
+def test_is_concession_ignores_only_padding():
+    assert society._is_concession(society.NO_MORE_OBJECTION) is True
+    assert society._is_concession(f"  {society.NO_MORE_OBJECTION}。 ") is True
+    # 后面还有话 → 不算数
+    assert society._is_concession(f"{society.NO_MORE_OBJECTION}不过还有两点") is False
+    assert society._is_concession("") is False
+    assert society._is_concession("我同意这个方向。") is False
+
+
 def test_digest_produces_section(backend):
     topic = TOPICS[0]
     transcript = society.debate_topic(topic, backend=backend, rounds=1)

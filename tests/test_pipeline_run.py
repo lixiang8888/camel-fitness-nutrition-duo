@@ -644,3 +644,88 @@ def test_cli_no_subcommand_prints_help(capsys):
 
     assert cli.main([]) == 1
     assert "usage: fitness-duo" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# 提前收手（rounds 是上限，不是定额）
+#
+# 判据本身的单元测试在 test_pipeline.py；这里只测「谁来决定开不开」——
+# 以及 mock 必须把它关掉。
+# ---------------------------------------------------------------------------
+
+class _ConcedingBackend(ScriptedBackend):
+    """教练（奇数调用）从第 2 轮起只回「无异议」。同 test_pipeline.ConcedingBackend。"""
+
+    def _reply(self, messages):
+        self._calls += 1
+        if self._calls >= 3 and self._calls % 2 == 1:
+            return society.NO_MORE_OBJECTION
+        return f"[假后端] 第 {self._calls} 次调用。"
+
+
+def test_mock_disables_convergence(backend, tmp_path):
+    """mock 恒跑满：它的职责就是证明「循环确实跑了 N 轮」。
+
+    ScriptedBackend 只会吐固定模板、本来也触发不了，但这里是**显式**关掉的
+    （pipeline 里 `converge and not mock`），不靠「模板里恰好没有那句话」。
+    """
+    result = pipeline.run_pipeline(
+        backend=backend,
+        rounds=4,
+        topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path,
+        mock=True,
+        converge=True,
+    )
+
+    transcript = result.transcripts[0]
+    assert transcript.stopped_early is False
+    assert len(transcript.turns) == 1 + 4 * 2
+    assert "收手" not in result.transcript_path.read_text(encoding="utf-8")
+
+
+def test_converge_false_forces_full_rounds(tmp_path):
+    """--no-converge：一键回到死板跑满。"""
+    result = pipeline.run_pipeline(
+        backend=_ConcedingBackend(),
+        rounds=4,
+        topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path,
+        mock=False,
+        converge=False,
+    )
+
+    assert result.transcripts[0].stopped_early is False
+    assert len(result.transcripts[0].turns) == 1 + 4 * 2
+
+
+def test_converge_true_stops_early_in_real_mode(tmp_path):
+    result = pipeline.run_pipeline(
+        backend=_ConcedingBackend(),
+        rounds=4,
+        topics=pipeline.resolve_topics(["baseline"]),
+        out_dir=tmp_path,
+        mock=False,
+        converge=True,
+    )
+
+    transcript = result.transcripts[0]
+    assert transcript.stopped_early is True
+    assert transcript.rounds_run == 2
+    # 对话实录里要留下这件事的痕迹，不然用户只会觉得这一节莫名其妙地短
+    assert "收手" in result.transcript_path.read_text(encoding="utf-8")
+
+
+def test_cli_topic_done_line_is_unchanged_without_a_concession():
+    """钉住 mock 的终端输出：没收手时这一行必须与从前逐字相同。"""
+    from fitness_duo import cli
+
+    done = society.TopicTranscript(topic=TOPICS[0], turns=[], stopped_early=False)
+    assert cli._topic_done_line(done) == "    对话完成，共 0 条发言"
+
+    stopped = society.TopicTranscript(
+        topic=TOPICS[0], turns=[], stopped_early=True, rounds_run=2
+    )
+    line = cli._topic_done_line(stopped)
+    assert line.startswith("    对话完成，共 0 条发言")
+    assert "提前收手" in line and "第 2 轮" in line

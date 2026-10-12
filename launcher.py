@@ -136,11 +136,15 @@ class _Session:
         rounds: int,
         mock: bool,
         profile: Profile | None = None,
+        converge: bool = True,
     ) -> None:
         self.bus = bus
         self.topics = topics
         self.rounds = rounds
         self.mock = mock
+        #: 教练没有新的反对意见时提前收手（`rounds` 因此是上限，不是定额）。
+        #: mock 模式下由 pipeline 内部再关掉——这里不用重复判断。
+        self.converge = converge
         #: 读者档案。进 worker 之后**只读**：不在 server 上另存一份让两边都能读，
         #: 那正是「worker 写了 session、路由读了 server」那种对不上的老毛病。
         self.profile = profile
@@ -193,6 +197,9 @@ class _Session:
                 "type": "topic_done",
                 "topic": topic.key,
                 "turns": len(transcript.turns),
+                # 提前收手时页面要说一句，否则用户只会看见这一节莫名其妙地短
+                "early": transcript.stopped_early,
+                "roundsRun": transcript.rounds_run,
             })
 
         def section_start(topic, is_closing: bool) -> None:
@@ -244,6 +251,7 @@ class _Session:
                 hooks=self._hooks(),
                 should_stop=self.stopped.is_set,
                 profile=self.profile,
+                converge=self.converge,
             )
             self.handbook = result.handbook
             self.handbook_path = result.handbook_path
@@ -407,6 +415,8 @@ class _Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 rounds = 3
             mock = bool(body.get("mock"))
+            # 缺省为真：老页面（没这个键）与手搓的请求都走「会提前收手」这一支
+            converge = bool(body.get("converge", True))
 
             # 档案的校验必须在 bus.reset() **之前**：填错一个年龄就把上一轮的
             # 对话历史清掉，是很讨厌的一种失败方式。
@@ -433,11 +443,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.server.bus.reset()
 
             session = _Session(
-                self.server.bus, topics=topics, rounds=rounds, mock=mock, profile=reader
+                self.server.bus, topics=topics, rounds=rounds, mock=mock,
+                profile=reader, converge=converge,
             )
             self.server.session = session
             session.start()
             self._json({"ok": True, "rounds": rounds, "mock": mock,
+                        "converge": converge,
                         "topics": [t.key for t in topics],
                         "profile": reader.summary() if reader else ""})
         elif path == "/stop":
@@ -804,7 +816,7 @@ _PAGE = r"""<!DOCTYPE html>
     <div class="row">
       <button id="toggleAdd">＋ 添加议题</button>
       <span class="spacer"></span>
-      <span style="font-size:13px">每个议题</span>
+      <span style="font-size:13px">每个议题最多</span>
       <select id="rounds">
         <option value="1">1 轮</option>
         <option value="2">2 轮</option>
@@ -813,6 +825,10 @@ _PAGE = r"""<!DOCTYPE html>
         <option value="5">5 轮</option>
         <option value="6">6 轮</option>
       </select>
+      <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer"
+             title="教练对当前方案已经提不出新的反对意见时，这个议题就到此为止，不再跑满上面的轮数">
+        <input type="checkbox" id="converge" checked> 谈拢了就收手
+      </label>
       <label style="font-size:13px;display:flex;align-items:center;gap:5px;cursor:pointer">
         <input type="checkbox" id="mock"> 模拟模式（不花钱）
       </label>
@@ -900,8 +916,10 @@ function updateHint() {
   $("modehint").className = on ? "hint" : "hint cost";
   $("modehint").textContent = on
     ? "模拟模式：不调用 DeepSeek、不联网、不花钱。产出是占位内容，每条回复几乎一样，仅用来验证流程能跑通。"
-    : "真实模式：调用 DeepSeek，按用量计费，而且慢——默认 6 议题 × 3 轮就是 42 次模型调用，"
-      + "每次通常十几秒，整轮一般要 10 分钟以上。跑起来后右边会显示预计还需多久。";
+      + "模拟后端只会吐固定模板，所以它恒跑满轮数——「谈拢了就收手」在模拟模式下不生效。"
+    : "真实模式：调用 DeepSeek，按用量计费，而且慢——默认 6 议题 × 3 轮最多 42 次模型调用，"
+      + "每次通常十几秒，整轮一般要 10 分钟以上。跑起来后右边会显示预计还需多久。"
+      + "轮数是上限：教练提不出新反对意见的议题会提前收手，实际比这少。";
 }
 
 // ---- 自定义议题 ----
@@ -1186,6 +1204,7 @@ function setRunning(on) {
   $("start").disabled = on;
   $("stop").disabled = !on;
   $("rounds").disabled = on;
+  $("converge").disabled = on;
   $("mock").disabled = on;
   $("toggleAdd").disabled = on;
   ["f-title", "f-brief", "f-goal", "f-opening", "f-add", "f-cancel"]
@@ -1216,7 +1235,8 @@ function notice(text, tone) {
 // 用户第一反应就是「卡死了」。所以给三样一直在动的东西：
 //   1. 脉冲的状态点（见 .dot.live 的动画）
 //   2. 逐秒走的计时器
-//   3. 发言进度 N/M —— 每个议题的发言条数是固定的，总数在开跑前就能算出来
+//   3. 发言进度 N/M —— M 是「轮数 × 议题数」算出来的**上限**，开跑前就能算出来。
+//      某个议题提前收手（教练没新意见了）时实际条数会少一点，计数器停不到 M。
 let timerId = null, startedAt = 0, turnsDone = 0, turnsTotal = 0, nextSpeaker = "";
 let runProfile = "";        // 本次运行的档案摘要，挂在进度行上
 
@@ -1247,7 +1267,7 @@ function updateCounter() {
   $("counter").textContent = turnsTotal ? "发言 " + turnsDone + "/" + turnsTotal : "";
 }
 function beginRun(total, rounds) {
-  turnsTotal = total * (1 + rounds * 2);   // 1 条开场 + 每轮「教练问、营养师答」
+  turnsTotal = total * (1 + rounds * 2);   // 上限：1 条开场 + 每轮「教练问、营养师答」
   turnsDone = 0;
   nextSpeaker = SIDE_NAME.lin;
   startedAt = Date.now();
@@ -1314,6 +1334,12 @@ function handle(ev) {
     $("progress").textContent = "[" + ev.index + "/" + ev.total + "] " + ev.title
       + (runProfile ? "　—　本次针对：" + runProfile : "");
     setStatus("对谈中", "live");
+  } else if (ev.type === "topic_done") {
+    // 提前收手要明说。不说的话，用户只会看到这一节莫名其妙地比别人短，
+    // 然后怀疑是不是模型抽风了、或者代码坏了。
+    if (ev.early) {
+      $("progress").textContent += "　→ 教练已无新意见，第 " + ev.roundsRun + " 轮收手";
+    }
   } else if (ev.type === "turn") {
     appendTurn(ev);
     turnsDone += 1;
@@ -1401,6 +1427,7 @@ $("start").onclick = async () => {
     custom: mine,
     rounds: parseInt($("rounds").value, 10),
     mock: $("mock").checked,
+    converge: $("converge").checked,
     profile: collectProfile()
   });
   if (!res.ok) {

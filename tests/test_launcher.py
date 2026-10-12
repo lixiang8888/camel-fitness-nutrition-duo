@@ -14,10 +14,12 @@ import socket
 import threading
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
 import launcher
+from fitness_duo.topics import TOPICS
 
 
 # ---------------------------------------------------------------------------
@@ -490,3 +492,40 @@ def test_bad_profile_does_not_wipe_the_previous_run(live_server):
 
     # 历史还在：新订阅者一上来照样能补回上一轮
     assert server.bus.subscribe().get_nowait()["text"] == "上一轮的内容"
+
+
+# ---------------------------------------------------------------------------
+# 提前收手：事件里必须带上标志
+# ---------------------------------------------------------------------------
+
+def test_topic_done_event_carries_the_early_flag():
+    """页面靠这个标志说明「这一节为什么比别人短」。"""
+    session = launcher._Session(launcher._Bus(), topics=[], rounds=4, mock=False)
+    q = session.bus.subscribe()
+
+    hooks = session._hooks()
+    hooks.on_topic_done(
+        TOPICS[0],
+        SimpleNamespace(turns=[1, 2, 3, 4], stopped_early=True, rounds_run=2),
+    )
+
+    ev = q.get_nowait()
+    assert ev["type"] == "topic_done"
+    assert ev["topic"] == TOPICS[0].key
+    assert ev["turns"] == 4
+    assert ev["early"] is True
+    assert ev["roundsRun"] == 2
+
+
+def test_topic_done_event_reports_a_full_run_as_not_early():
+    session = launcher._Session(launcher._Bus(), topics=[], rounds=4, mock=False)
+    q = session.bus.subscribe()
+
+    session._hooks().on_topic_done(
+        TOPICS[0],
+        SimpleNamespace(turns=[1] * 9, stopped_early=False, rounds_run=4),
+    )
+
+    ev = q.get_nowait()
+    assert ev["early"] is False
+    assert ev["roundsRun"] == 4
